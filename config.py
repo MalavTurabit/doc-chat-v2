@@ -19,7 +19,7 @@ AZURE_LLM_DEPLOYMENT   = os.getenv("AZURE_LLM_DEPLOYMENT")
 SUPPORTED_EXTENSIONS   = {".pdf", ".docx", ".pptx", ".xlsx"}
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
-CHUNK_SIZE_TOKENS      = 512
+CHUNK_SIZE_TOKENS      = 400
 CHUNK_OVERLAP_TOKENS   = 50
 
 # ── Embedding ────────────────────────────────────────────────────────────────
