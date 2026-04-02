@@ -40,19 +40,24 @@ def build_graph():
 graph = build_graph()
 
 
-def run(query: str, doc_id: str, filename: str) -> str:
+def run(query: str, doc_id: str, filename: str,
+        current_text: str = "", edit_history: list = None) -> dict:
     """
-    Single entry point used by tests and Streamlit.
+    Returns a dict with response, edit_history, current_text.
     """
     state = {
-        "messages":     [HumanMessage(content=query)],
-        "doc_id":       doc_id,
-        "filename":     filename,
-        "intent":       None,
+        "messages":         [HumanMessage(content=query)],
+        "doc_id":           doc_id,
+        "filename":         filename,
+        "intent":           None,
         "retrieved_chunks": [],
-        "response":     "",
-        "current_text": "",
-        "edit_history": [],
+        "response":         "",
+        "current_text":     current_text,
+        "edit_history":     edit_history or [],
     }
     result = graph.invoke(state)
-    return result["response"]
+    return {
+        "response":     result["response"],
+        "edit_history": result.get("edit_history", []),
+        "current_text": result.get("current_text", ""),
+    }
