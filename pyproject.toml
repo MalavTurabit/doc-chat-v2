@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "langchain-core>=1.2.24",
+    "langchain-openai>=1.1.12",
+    "langgraph>=1.1.4",
     "openai>=2.30.0",
     "openpyxl>=3.1.5",
     "pymilvus[milvus-lite]>=2.6.11",
