@@ -10,3 +10,5 @@ wheels/
 .venv
 
 .env
+
+doc_chat.db
