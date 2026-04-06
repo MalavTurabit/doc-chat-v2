@@ -16,7 +16,7 @@ AZURE_LLM_API_VERSION  = os.getenv("AZURE_LLM_API_VERSION")
 AZURE_LLM_DEPLOYMENT   = os.getenv("AZURE_LLM_DEPLOYMENT")
 
 # ── Extraction ───────────────────────────────────────────────────────────────
-SUPPORTED_EXTENSIONS   = {".pdf", ".docx", ".pptx", ".xlsx"}
+SUPPORTED_EXTENSIONS   = {".pdf", ".docx", ".pptx", ".xlsx",".csv", ".txt"}
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
 CHUNK_SIZE_TOKENS      = 400
@@ -28,3 +28,6 @@ EMBEDDING_DIM          = 3072   # text-embedding-3-large
 # ── Milvus ───────────────────────────────────────────────────────────────────
 MILVUS_DB_PATH         = "./doc_chat.db"
 MILVUS_COLLECTION      = "doc_chunks"
+# ── ElevenLabs ───────────────────────────────────────────────────────────────
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
