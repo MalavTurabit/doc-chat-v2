@@ -12,9 +12,6 @@ def get_client() -> MilvusClient:
 
 
 def init_collection():
-    """
-    Create the collection with explicit schema if it does not exist.
-    """
     client = get_client()
 
     if client.has_collection(MILVUS_COLLECTION):
@@ -26,6 +23,7 @@ def init_collection():
     schema.add_field("chunk_id",        DataType.VARCHAR, max_length=200, is_primary=True)
     schema.add_field("embedding",       DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
     schema.add_field("doc_id",          DataType.VARCHAR, max_length=100)
+    schema.add_field("session_id",      DataType.VARCHAR, max_length=100)
     schema.add_field("filename",        DataType.VARCHAR, max_length=300)
     schema.add_field("text",            DataType.VARCHAR, max_length=4000)
     schema.add_field("section_heading", DataType.VARCHAR, max_length=500)
@@ -58,6 +56,7 @@ def upsert_chunks(chunks: list[dict]):
             "chunk_id":        c["chunk_id"],
             "embedding":       c["embedding"],
             "doc_id":          c["doc_id"],
+            "session_id":      c.get("session_id", ""),
             "filename":        c["filename"],
             "text":            c["text"][:4000],
             "section_heading": (c["section_heading"] or "")[:500],
@@ -68,19 +67,33 @@ def upsert_chunks(chunks: list[dict]):
         })
 
     client.upsert(collection_name=MILVUS_COLLECTION, data=rows)
-    print(f"Upserted {len(rows)} chunks into '{MILVUS_COLLECTION}'.")
+    print(f"Upserted {len(rows)} chunks.")
 
 
-def search(query_vector: list[float], doc_id: str, top_k: int = 5) -> list[dict]:
+def search(
+    query_vector: list[float],
+    session_id:   str,
+    top_k:        int = 5,
+    doc_id:       str | None = None,
+) -> list[dict]:
+    """
+    Search by session_id (across all docs in session).
+    Optionally scope to a single doc_id for edit operations.
+    """
     client = get_client()
+
+    if doc_id:
+        filter_expr = f'session_id == "{session_id}" && doc_id == "{doc_id}"'
+    else:
+        filter_expr = f'session_id == "{session_id}"'
 
     results = client.search(
         collection_name=MILVUS_COLLECTION,
         data=[query_vector],
-        filter=f'doc_id == "{doc_id}"',
+        filter=filter_expr,
         limit=top_k,
         output_fields=[
-            "chunk_id", "doc_id", "filename", "text",
+            "chunk_id", "doc_id", "session_id", "filename", "text",
             "section_heading", "page", "start_char", "end_char",
         ],
     )
@@ -94,6 +107,37 @@ def search(query_vector: list[float], doc_id: str, top_k: int = 5) -> list[dict]
     return hits
 
 
+def get_all_chunks(session_id: str, doc_id: str | None = None) -> list[dict]:
+    """
+    Retrieve all chunks for a session (or single doc within session).
+    Used for summarise intent.
+    """
+    client = get_client()
+
+    if doc_id:
+        filter_expr = f'session_id == "{session_id}" && doc_id == "{doc_id}"'
+    else:
+        filter_expr = f'session_id == "{session_id}"'
+
+    return client.query(
+        collection_name=MILVUS_COLLECTION,
+        filter=filter_expr,
+        output_fields=[
+            "chunk_id", "doc_id", "session_id", "filename", "text",
+            "section_heading", "page", "start_char", "end_char", "token_count",
+        ],
+    )
+
+
+def delete_session(session_id: str):
+    client = get_client()
+    client.delete(
+        collection_name=MILVUS_COLLECTION,
+        filter=f'session_id == "{session_id}"',
+    )
+    print(f"Deleted all chunks for session_id='{session_id}'.")
+
+
 def delete_document(doc_id: str):
     client = get_client()
     client.delete(
@@ -101,16 +145,3 @@ def delete_document(doc_id: str):
         filter=f'doc_id == "{doc_id}"',
     )
     print(f"Deleted all chunks for doc_id='{doc_id}'.")
-
-
-def get_all_chunks(doc_id: str) -> list[dict]:
-    client = get_client()
-    results = client.query(
-        collection_name=MILVUS_COLLECTION,
-        filter=f'doc_id == "{doc_id}"',
-        output_fields=[
-            "chunk_id", "doc_id", "filename", "text",
-            "section_heading", "page", "start_char", "end_char", "token_count",
-        ],
-    )
-    return results

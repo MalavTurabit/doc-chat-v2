@@ -40,24 +40,29 @@ def build_graph():
 graph = build_graph()
 
 
-def run(query: str, doc_id: str, filename: str,
-        current_text: str = "", edit_history: list = None) -> dict:
-    """
-    Returns a dict with response, edit_history, current_text.
-    """
+def run(
+    query:      str,
+    session_id: str,
+    memory:     list[dict] = None,
+) -> dict:
     state = {
         "messages":         [HumanMessage(content=query)],
-        "doc_id":           doc_id,
-        "filename":         filename,
+        "session_id":       session_id,
+        "doc_id":           "",
+        "filename":         "",
         "intent":           None,
         "retrieved_chunks": [],
+        "memory":           memory or [],
         "response":         "",
-        "current_text":     current_text,
-        "edit_history":     edit_history or [],
+        "sources":          [],
+        "edit_record":      {},
+        "current_text":     "",
+        "edit_history":     [],
     }
     result = graph.invoke(state)
     return {
-        "response":     result["response"],
-        "edit_history": result.get("edit_history", []),
-        "current_text": result.get("current_text", ""),
+        "response":    result["response"],
+        "intent":      result["intent"],
+        "sources":     result.get("sources", []),
+        "edit_record": result.get("edit_record", {}),
     }
