@@ -52,11 +52,16 @@ def generate_script(session_id: str) -> str:
         json={
             "session_id": session_id,
             "query": (
-                "Give me a clear, engaging audio explanation of this document. "
-                "Write it as a spoken narration — no bullet points, no markdown, "
-                "no headings. Just natural flowing sentences a listener can follow. "
-                "Cover the main purpose, key points, and any important numbers or policies. "
-                "Keep it under 900 words."
+            "You are my best friend explaining this document to me the night before my exam. "
+            "I am stressed and need to understand it quickly. "
+            "Talk to me like a friend — casual, warm, encouraging. "
+            "Use simple words, real examples, and analogies where it helps. "
+            "Occasionally say things like 'okay so listen', 'this is the important bit', "
+            "'don't worry this part is simple', 'trust me you need to remember this one'. "
+            "Cover all the key points, important numbers, rules and policies. "
+            "No bullet points, no markdown, no headings — just talk to me naturally like "
+            "we are sitting together the night before the exam. "
+            "Keep it under 900 words and make sure I actually feel ready after hearing it."
             ),
         },
     )

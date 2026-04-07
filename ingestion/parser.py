@@ -181,28 +181,70 @@ def _parse_xlsx(path: Path) -> list[dict]:
     char_cursor = 0
 
     for sheet in wb.worksheets:
-        rows = []
+        all_rows = []
         for row in sheet.iter_rows(values_only=True):
             cells    = [str(c).strip() if c is not None else "" for c in row]
             row_text = " | ".join(cells).strip(" |")
             if row_text:
-                rows.append(row_text)
+                all_rows.append(row_text)
 
-        if not rows:
+        if not all_rows:
             continue
 
-        text  = f"[Sheet: {sheet.title}]\n" + "\n".join(rows)
-        start = char_cursor
-        end   = char_cursor + len(text)
-        char_cursor = end + 1
+        header = all_rows[0]          # first row = header
+        data_rows = all_rows[1:]      # rest = data
 
-        blocks.append({
-            "type":       "table",
-            "text":       text,
-            "page":       sheet.title,
-            "start_char": start,
-            "end_char":   end,
-        })
+        # if small enough — keep as single chunk (original behaviour)
+        full_text = f"[Sheet: {sheet.title}]\n" + "\n".join(all_rows)
+        if len(full_text) <= 3000 and len(all_rows) <= 50:
+            start = char_cursor
+            end   = char_cursor + len(full_text)
+            char_cursor = end + 1
+            blocks.append({
+                "type":       "table",
+                "text":       full_text,
+                "page":       sheet.title,
+                "start_char": start,
+                "end_char":   end,
+            })
+            continue
+
+        # large sheet — chunk by rows, repeating header on every chunk
+        chunk_rows  = []
+        chunk_tokens = 0
+
+        def flush_xlsx_chunk(sheet_title, header, rows, char_cursor):
+            text  = f"[Sheet: {sheet_title}]\n{header}\n" + "\n".join(rows)
+            start = char_cursor
+            end   = char_cursor + len(text)
+            return {
+                "type":       "table",
+                "text":       text,
+                "page":       sheet_title,
+                "start_char": start,
+                "end_char":   end,
+            }, end + 1
+
+        for row_text in data_rows:
+            row_tokens = len(row_text.split())   # rough token estimate for rows
+
+            if chunk_tokens + row_tokens > 300 and chunk_rows:
+                block, char_cursor = flush_xlsx_chunk(
+                    sheet.title, header, chunk_rows, char_cursor
+                )
+                blocks.append(block)
+                chunk_rows  = []
+                chunk_tokens = 0
+
+            chunk_rows.append(row_text)
+            chunk_tokens += row_tokens
+
+        # flush remaining rows
+        if chunk_rows:
+            block, char_cursor = flush_xlsx_chunk(
+                sheet.title, header, chunk_rows, char_cursor
+            )
+            blocks.append(block)
 
     return blocks
 
@@ -216,27 +258,70 @@ def _parse_csv(path: Path) -> list[dict]:
     char_cursor = 0
 
     with open(str(path), newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        rows   = []
+        reader   = csv.reader(f)
+        all_rows = []
         for row in reader:
             row_text = " | ".join(cell.strip() for cell in row)
             if row_text.strip(" |"):
-                rows.append(row_text)
+                all_rows.append(row_text)
 
-    if not rows:
+    if not all_rows:
         return blocks
 
-    text  = f"[CSV: {path.name}]\n" + "\n".join(rows)
-    start = char_cursor
-    end   = char_cursor + len(text)
+    header    = all_rows[0]
+    data_rows = all_rows[1:]
 
-    blocks.append({
-        "type":       "table",
-        "text":       text,
-        "page":       path.name,
-        "start_char": start,
-        "end_char":   end,
-    })
+    # small CSV — single chunk
+    full_text = f"[CSV: {path.name}]\n" + "\n".join(all_rows)
+    if len(full_text) <= 3000 and len(all_rows) <= 50:
+        start = char_cursor
+        end   = char_cursor + len(full_text)
+        blocks.append({
+            "type":       "table",
+            "text":       full_text,
+            "page":       path.name,
+            "start_char": start,
+            "end_char":   end,
+        })
+        return blocks
+
+    # large CSV — chunk by rows, header repeated on every chunk
+    chunk_rows   = []
+    chunk_tokens = 0
+
+    for row_text in data_rows:
+        row_tokens = len(row_text.split())
+
+        if chunk_tokens + row_tokens > 300 and chunk_rows:
+            text  = f"[CSV: {path.name}]\n{header}\n" + "\n".join(chunk_rows)
+            start = char_cursor
+            end   = char_cursor + len(text)
+            char_cursor = end + 1
+            blocks.append({
+                "type":       "table",
+                "text":       text,
+                "page":       path.name,
+                "start_char": start,
+                "end_char":   end,
+            })
+            chunk_rows   = []
+            chunk_tokens = 0
+
+        chunk_rows.append(row_text)
+        chunk_tokens += row_tokens
+
+    # flush remaining
+    if chunk_rows:
+        text  = f"[CSV: {path.name}]\n{header}\n" + "\n".join(chunk_rows)
+        start = char_cursor
+        end   = char_cursor + len(text)
+        blocks.append({
+            "type":       "table",
+            "text":       text,
+            "page":       path.name,
+            "start_char": start,
+            "end_char":   end,
+        })
 
     return blocks
 
