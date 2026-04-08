@@ -1,7 +1,6 @@
 import tiktoken
 from config import CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS
 
-
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
@@ -10,19 +9,14 @@ def count_tokens(text: str) -> int:
 
 
 def chunk_document(doc: dict) -> list[dict]:
-    """
-    Paragraph-aware greedy chunker.
-    Receives the doc dict from parser.extract() and returns a list of chunks.
-    Each chunk carries the text, metadata, and char offsets from the source doc.
-    """
-    blocks     = doc["blocks"]
-    doc_id     = doc["doc_id"]
-    filename   = doc["filename"]
-    chunks     = []
+    blocks   = doc["blocks"]
+    doc_id   = doc["doc_id"]
+    filename = doc["filename"]
+    chunks   = []
 
-    current_blocks   = []
-    current_tokens   = 0
-    current_heading  = None
+    current_blocks  = []
+    current_tokens  = 0
+    current_heading = None
 
     def flush(current_blocks, current_heading):
         if not current_blocks:
@@ -31,9 +25,8 @@ def chunk_document(doc: dict) -> list[dict]:
         start_char = current_blocks[0]["start_char"]
         end_char   = current_blocks[-1]["end_char"]
         page       = current_blocks[0]["page"]
-
         chunks.append({
-            "chunk_id":        None,           # assigned in milvus_client
+            "chunk_id":        None,
             "doc_id":          doc_id,
             "filename":        filename,
             "text":            text,
@@ -46,18 +39,16 @@ def chunk_document(doc: dict) -> list[dict]:
 
     for block in blocks:
 
-        # headings update the running section label but are not chunked alone
         if block["type"] == "heading":
             current_heading = block["text"]
             continue
 
-        block_tokens = count_tokens(block["text"])
-
-        # tables always get their own chunk regardless of size
+        # tables from CSV/XLSX parser come pre-chunked — pass through directly
+        # do NOT feed them into the greedy merger
         if block["type"] == "table":
             flush(current_blocks, current_heading)
-            current_blocks  = []
-            current_tokens  = 0
+            current_blocks = []
+            current_tokens = 0
             chunks.append({
                 "chunk_id":        None,
                 "doc_id":          doc_id,
@@ -67,15 +58,14 @@ def chunk_document(doc: dict) -> list[dict]:
                 "page":            block["page"],
                 "start_char":      block["start_char"],
                 "end_char":        block["end_char"],
-                "token_count":     block_tokens,
+                "token_count":     count_tokens(block["text"]),
             })
             continue
 
-        # if adding this block exceeds the limit, flush and start fresh
+        block_tokens = count_tokens(block["text"])
+
         if current_tokens + block_tokens > CHUNK_SIZE_TOKENS:
             flush(current_blocks, current_heading)
-
-            # overlap: carry the last block into the new chunk
             if current_blocks:
                 overlap_block  = current_blocks[-1]
                 current_blocks = [overlap_block]
@@ -87,10 +77,8 @@ def chunk_document(doc: dict) -> list[dict]:
         current_blocks.append(block)
         current_tokens += block_tokens
 
-    # flush whatever is left
     flush(current_blocks, current_heading)
 
-    # assign sequential chunk IDs
     for i, chunk in enumerate(chunks):
         chunk["chunk_id"] = f"{doc_id}_{i}"
 

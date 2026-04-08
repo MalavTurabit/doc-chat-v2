@@ -6,6 +6,9 @@ from graph.nodes import (
     retriever_node,
     generate_node,
     edit_node,
+    general_node,
+    compare_node,
+    analyse_node,
 )
 
 
@@ -20,19 +23,28 @@ def build_graph():
     g.add_node("retriever",       retriever_node)
     g.add_node("generate",        generate_node)
     g.add_node("edit",            edit_node)
+    g.add_node("general",         general_node)
+    g.add_node("compare",         compare_node)
+    g.add_node("analyse",         analyse_node)
 
     g.set_entry_point("classify_intent")
 
     g.add_conditional_edges("classify_intent", route_intent, {
+        "general":   "general",
         "summarise": "retriever",
         "explain":   "retriever",
         "qa":        "retriever",
         "edit":      "edit",
+        "compare":   "compare",
+        "analyse":   "analyse",
     })
 
     g.add_edge("retriever", "generate")
     g.add_edge("generate",  END)
     g.add_edge("edit",      END)
+    g.add_edge("general",   END)
+    g.add_edge("compare",   END)
+    g.add_edge("analyse",   END)
 
     return g.compile()
 

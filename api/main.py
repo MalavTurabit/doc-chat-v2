@@ -1,5 +1,7 @@
 import tempfile
 import os
+import time
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -21,6 +23,13 @@ from vectorstore.milvus_client import init_collection, upsert_chunks, delete_ses
 from graph.graph import run
 from export.reconstructor import reconstruct_as_txt
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Doc Chat API", version="1.0.0")
 
 app.add_middleware(
@@ -30,28 +39,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# init Milvus on startup
+
 @app.on_event("startup")
 def startup():
     init_collection()
+    logger.info("Milvus collection ready.")
 
 
-# ── POST /session — create new session ───────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ── Session ───────────────────────────────────────────────────────────────────
 
 @app.post("/session")
 def create_session() -> dict:
     sid = new_session_id()
+    logger.info(f"[session] created — {sid}")
     return {"session_id": sid}
 
-
-# ── GET /session/{session_id} — session info ──────────────────────────────────
 
 @app.get("/session/{session_id}", response_model=SessionInfo)
 def get_session(session_id: str):
     return session_info(session_id)
 
 
-# ── POST /upload — upload and index a document ────────────────────────────────
+# ── Upload ────────────────────────────────────────────────────────────────────
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(
@@ -67,24 +83,49 @@ async def upload_document(
             detail=f"Unsupported file type: {suffix}. Supported: {supported}",
         )
 
-    # save to temp file
+    t0 = time.time()
+    logger.info(f"[upload] started — {file.filename}")
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content  = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
 
-    try:
-        doc    = extract(tmp_path)
-        doc["filename"] = file.filename
-        chunks = chunk_document(doc)
-        chunks = embed_chunks(chunks)
+    logger.info(
+        f"[upload] file saved — {time.time()-t0:.2f}s  "
+        f"size={len(content)/1024:.1f}KB"
+    )
 
-        # attach session_id and correct filename to every chunk
+    try:
+        t1 = time.time()
+        doc = extract(tmp_path)
+        doc["filename"] = file.filename
+        logger.info(
+            f"[upload] extracted {len(doc['blocks'])} blocks — "
+            f"{time.time()-t1:.2f}s"
+        )
+
+        t2 = time.time()
+        chunks = chunk_document(doc)
+        logger.info(
+            f"[upload] chunked into {len(chunks)} chunks — "
+            f"{time.time()-t2:.2f}s"
+        )
+
+        t3 = time.time()
+        chunks = embed_chunks(chunks)
+        logger.info(
+            f"[upload] embedded {len(chunks)} chunks — "
+            f"{time.time()-t3:.2f}s"
+        )
+
+        t4 = time.time()
         for c in chunks:
             c["session_id"] = session_id
-            c["filename"]   = file.filename   # ensure chunks carry real name too
+            c["filename"]   = file.filename
 
         upsert_chunks(chunks)
+        logger.info(f"[upload] upserted to Milvus — {time.time()-t4:.2f}s")
 
         add_doc(
             session_id=session_id,
@@ -93,8 +134,24 @@ async def upload_document(
             full_text=doc["full_text"],
         )
 
+        logger.info(f"[upload] total — {time.time()-t0:.2f}s")
+
+    except ValueError as e:
+        # clean user-facing errors — image-based PDF, unsupported content, etc.
+        logger.warning(f"[upload] rejected — {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except Exception as e:
+        # unexpected errors — log full details server side
+        logger.error(f"[upload] unexpected error — {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred during upload. Check server logs.",
+        )
+
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
     return UploadResponse(
         doc_id=doc["doc_id"],
@@ -104,7 +161,7 @@ async def upload_document(
     )
 
 
-# ── POST /chat — unified multi-doc chat ───────────────────────────────────────
+# ── Chat ──────────────────────────────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -114,6 +171,9 @@ def chat(req: ChatRequest):
             detail="No documents uploaded for this session.",
         )
 
+    t0 = time.time()
+    logger.info(f"[chat] query='{req.query[:60]}...'  session={req.session_id[:8]}")
+
     memory = get_memory(req.session_id)
 
     result = run(
@@ -122,13 +182,17 @@ def chat(req: ChatRequest):
         memory=memory,
     )
 
-    # store edit record if this was an edit
     if result.get("edit_record"):
         add_edit(req.session_id, result["edit_record"])
 
-    # update memory
     add_message(req.session_id, "user",      req.query)
     add_message(req.session_id, "assistant", result["response"])
+
+    logger.info(
+        f"[chat] intent={result['intent']}  "
+        f"sources={result['sources']}  "
+        f"total={time.time()-t0:.2f}s"
+    )
 
     return ChatResponse(
         response=result["response"],
@@ -137,7 +201,7 @@ def chat(req: ChatRequest):
     )
 
 
-# ── GET /download/{session_id} — download updated txt ────────────────────────
+# ── Download ──────────────────────────────────────────────────────────────────
 
 @app.get("/download/{session_id}")
 def download(session_id: str, doc_id: str | None = None):
@@ -148,7 +212,6 @@ def download(session_id: str, doc_id: str | None = None):
         raise HTTPException(status_code=404, detail="No documents found.")
 
     if doc_id:
-        # download single doc
         if doc_id not in full_texts:
             raise HTTPException(status_code=404, detail="doc_id not found.")
         doc_edits = [e for e in edits if e["doc_id"] == doc_id]
@@ -159,28 +222,32 @@ def download(session_id: str, doc_id: str | None = None):
         )
         stem = Path(filename).stem
     else:
-        # download all docs combined
         parts = []
         for d in get_docs(session_id):
-            did      = d["doc_id"]
+            did       = d["doc_id"]
             doc_edits = [e for e in edits if e["doc_id"] == did]
-            updated  = reconstruct_as_txt(full_texts[did], doc_edits)
+            updated   = reconstruct_as_txt(full_texts[did], doc_edits)
             parts.append(f"=== {d['filename']} ===\n\n{updated}")
         text = "\n\n\n".join(parts)
         stem = "all_documents"
+
+    logger.info(f"[download] session={session_id[:8]}  doc_id={doc_id}  chars={len(text)}")
 
     from fastapi.responses import Response
     return Response(
         content=text.encode("utf-8"),
         media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="{stem}_updated.txt"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{stem}_updated.txt"'
+        },
     )
 
 
-# ── DELETE /session/{session_id} ──────────────────────────────────────────────
+# ── Delete session ────────────────────────────────────────────────────────────
 
 @app.delete("/session/{session_id}", response_model=DeleteResponse)
 def delete_session_route(session_id: str):
     delete_session(session_id)
     clear_session(session_id)
+    logger.info(f"[session] deleted — {session_id}")
     return DeleteResponse(session_id=session_id, deleted=True)

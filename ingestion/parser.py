@@ -48,7 +48,9 @@ def _parse_pdf(path: Path) -> list[dict]:
 
             lines = []
             for line in block["lines"]:
-                line_text = " ".join(span["text"] for span in line["spans"]).strip()
+                line_text = " ".join(
+                    span["text"] for span in line["spans"]
+                ).strip()
                 if line_text:
                     lines.append(line_text)
 
@@ -56,7 +58,8 @@ def _parse_pdf(path: Path) -> list[dict]:
             if not text:
                 continue
 
-            first_size = block["lines"][0]["spans"][0]["size"] if block["lines"] else 0
+            first_size = block["lines"][0]["spans"][0]["size"] \
+                if block["lines"] else 0
             elem_type  = "heading" if first_size >= 14 else "paragraph"
 
             start = char_cursor
@@ -132,6 +135,62 @@ def _parse_docx(path: Path) -> list[dict]:
 
 # ── PPTX ──────────────────────────────────────────────────────────────────────
 
+def _parse_pdf(path: Path) -> list[dict]:
+    import fitz
+
+    doc = fitz.open(str(path))
+    blocks = []
+    char_cursor = 0
+
+    for page_num, page in enumerate(doc, start=1):
+        page_dict = page.get_text("dict")
+
+        for block in page_dict["blocks"]:
+            if block["type"] != 0:
+                continue
+
+            lines = []
+            for line in block["lines"]:
+                line_text = " ".join(
+                    span["text"] for span in line["spans"]
+                ).strip()
+                if line_text:
+                    lines.append(line_text)
+
+            text = "\n".join(lines).strip()
+            if not text:
+                continue
+
+            first_size = block["lines"][0]["spans"][0]["size"] \
+                if block["lines"] else 0
+            elem_type  = "heading" if first_size >= 14 else "paragraph"
+
+            start = char_cursor
+            end   = char_cursor + len(text)
+            char_cursor = end + 1
+
+            blocks.append({
+                "type":       elem_type,
+                "text":       text,
+                "page":       page_num,
+                "start_char": start,
+                "end_char":   end,
+            })
+
+    doc.close()
+
+    # guard: if almost no text was extracted, PDF is likely image-based
+    full_text = _build_full_text(blocks)
+    if len(full_text.strip()) < 50:
+        raise ValueError(
+            f"'{path.name}' appears to be an image-based or scanned PDF with no "
+            f"extractable text. Please use a PDF with selectable text, or run OCR "
+            f"on it first before uploading."
+        )
+
+    return blocks
+# ── PPTX ──────────────────────────────────────────────────────────────────────
+
 def _parse_pptx(path: Path) -> list[dict]:
     from pptx import Presentation
 
@@ -144,20 +203,23 @@ def _parse_pptx(path: Path) -> list[dict]:
             if not shape.has_text_frame:
                 continue
 
-            is_title = (
-                hasattr(shape, "placeholder_format")
-                and shape.placeholder_format is not None
-                and shape.placeholder_format.idx == 0
-            )
+            try:
+                is_title = (
+                    shape.is_placeholder
+                    and shape.placeholder_format is not None
+                    and shape.placeholder_format.idx == 0
+                )
+            except Exception:
+                is_title = False
 
             for para in shape.text_frame.paragraphs:
                 text = para.text.strip()
                 if not text:
                     continue
 
-                elem_type = "heading" if is_title else "paragraph"
-                start     = char_cursor
-                end       = char_cursor + len(text)
+                elem_type   = "heading" if is_title else "paragraph"
+                start       = char_cursor
+                end         = char_cursor + len(text)
                 char_cursor = end + 1
 
                 blocks.append({
@@ -168,10 +230,14 @@ def _parse_pptx(path: Path) -> list[dict]:
                     "end_char":   end,
                 })
 
+
     return blocks
 
-
 # ── XLSX ──────────────────────────────────────────────────────────────────────
+
+
+_XLSX_ROWS_PER_CHUNK = 80
+
 
 def _parse_xlsx(path: Path) -> list[dict]:
     import openpyxl
@@ -191,12 +257,12 @@ def _parse_xlsx(path: Path) -> list[dict]:
         if not all_rows:
             continue
 
-        header = all_rows[0]          # first row = header
-        data_rows = all_rows[1:]      # rest = data
+        header    = all_rows[0]
+        data_rows = all_rows[1:]
 
-        # if small enough — keep as single chunk (original behaviour)
+        # small sheet — single chunk
         full_text = f"[Sheet: {sheet.title}]\n" + "\n".join(all_rows)
-        if len(full_text) <= 3000 and len(all_rows) <= 50:
+        if len(data_rows) <= 50:
             start = char_cursor
             end   = char_cursor + len(full_text)
             char_cursor = end + 1
@@ -209,47 +275,34 @@ def _parse_xlsx(path: Path) -> list[dict]:
             })
             continue
 
-        # large sheet — chunk by rows, repeating header on every chunk
-        chunk_rows  = []
-        chunk_tokens = 0
-
-        def flush_xlsx_chunk(sheet_title, header, rows, char_cursor):
-            text  = f"[Sheet: {sheet_title}]\n{header}\n" + "\n".join(rows)
+        # large sheet — chunk by row count, header repeated every chunk
+        for i in range(0, len(data_rows), _XLSX_ROWS_PER_CHUNK):
+            row_group = data_rows[i: i + _XLSX_ROWS_PER_CHUNK]
+            text      = (
+                f"[Sheet: {sheet.title}  "
+                f"rows {i+1}-{i+len(row_group)}]\n"
+                f"{header}\n"
+                + "\n".join(row_group)
+            )
             start = char_cursor
             end   = char_cursor + len(text)
-            return {
+            char_cursor = end + 1
+            blocks.append({
                 "type":       "table",
                 "text":       text,
-                "page":       sheet_title,
+                "page":       sheet.title,
                 "start_char": start,
                 "end_char":   end,
-            }, end + 1
-
-        for row_text in data_rows:
-            row_tokens = len(row_text.split())   # rough token estimate for rows
-
-            if chunk_tokens + row_tokens > 300 and chunk_rows:
-                block, char_cursor = flush_xlsx_chunk(
-                    sheet.title, header, chunk_rows, char_cursor
-                )
-                blocks.append(block)
-                chunk_rows  = []
-                chunk_tokens = 0
-
-            chunk_rows.append(row_text)
-            chunk_tokens += row_tokens
-
-        # flush remaining rows
-        if chunk_rows:
-            block, char_cursor = flush_xlsx_chunk(
-                sheet.title, header, chunk_rows, char_cursor
-            )
-            blocks.append(block)
+            })
 
     return blocks
 
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
+
+# Same row-per-chunk constant as XLSX
+_CSV_ROWS_PER_CHUNK = 80
+
 
 def _parse_csv(path: Path) -> list[dict]:
     import csv
@@ -272,10 +325,10 @@ def _parse_csv(path: Path) -> list[dict]:
     data_rows = all_rows[1:]
 
     # small CSV — single chunk
-    full_text = f"[CSV: {path.name}]\n" + "\n".join(all_rows)
-    if len(full_text) <= 3000 and len(all_rows) <= 50:
-        start = char_cursor
-        end   = char_cursor + len(full_text)
+    if len(data_rows) <= 50:
+        full_text = f"[CSV: {path.name}]\n" + "\n".join(all_rows)
+        start     = char_cursor
+        end       = char_cursor + len(full_text)
         blocks.append({
             "type":       "table",
             "text":       full_text,
@@ -285,36 +338,18 @@ def _parse_csv(path: Path) -> list[dict]:
         })
         return blocks
 
-    # large CSV — chunk by rows, header repeated on every chunk
-    chunk_rows   = []
-    chunk_tokens = 0
-
-    for row_text in data_rows:
-        row_tokens = len(row_text.split())
-
-        if chunk_tokens + row_tokens > 300 and chunk_rows:
-            text  = f"[CSV: {path.name}]\n{header}\n" + "\n".join(chunk_rows)
-            start = char_cursor
-            end   = char_cursor + len(text)
-            char_cursor = end + 1
-            blocks.append({
-                "type":       "table",
-                "text":       text,
-                "page":       path.name,
-                "start_char": start,
-                "end_char":   end,
-            })
-            chunk_rows   = []
-            chunk_tokens = 0
-
-        chunk_rows.append(row_text)
-        chunk_tokens += row_tokens
-
-    # flush remaining
-    if chunk_rows:
-        text  = f"[CSV: {path.name}]\n{header}\n" + "\n".join(chunk_rows)
+    # large CSV — chunk by row count, header repeated every chunk
+    for i in range(0, len(data_rows), _CSV_ROWS_PER_CHUNK):
+        row_group = data_rows[i: i + _CSV_ROWS_PER_CHUNK]
+        text      = (
+            f"[CSV: {path.name}  "
+            f"rows {i+1}-{i+len(row_group)}]\n"
+            f"{header}\n"
+            + "\n".join(row_group)
+        )
         start = char_cursor
         end   = char_cursor + len(text)
+        char_cursor = end + 1
         blocks.append({
             "type":       "table",
             "text":       text,
@@ -335,11 +370,9 @@ def _parse_txt(path: Path) -> list[dict]:
     with open(str(path), encoding="utf-8", errors="ignore") as f:
         raw = f.read()
 
-    # split on double newlines to get paragraphs
     paragraphs = [p.strip() for p in raw.split("\n\n") if p.strip()]
 
     for para in paragraphs:
-        # simple heading heuristic: short line, no period at end
         lines     = para.splitlines()
         elem_type = (
             "heading"

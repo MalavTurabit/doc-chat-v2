@@ -1,7 +1,13 @@
 from pymilvus import MilvusClient, DataType
 from config import MILVUS_DB_PATH, MILVUS_COLLECTION, EMBEDDING_DIM
+import logging
+
+logger = logging.getLogger(__name__)
 
 _client: MilvusClient | None = None
+
+# upsert in batches to avoid gRPC too_many_pings
+_UPSERT_BATCH_SIZE = 500
 
 
 def get_client() -> MilvusClient:
@@ -15,7 +21,7 @@ def init_collection():
     client = get_client()
 
     if client.has_collection(MILVUS_COLLECTION):
-        print(f"Collection '{MILVUS_COLLECTION}' already exists — skipping creation.")
+        logger.info(f"Collection '{MILVUS_COLLECTION}' already exists.")
         return
 
     schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
@@ -44,7 +50,7 @@ def init_collection():
         schema=schema,
         index_params=index_params,
     )
-    print(f"Collection '{MILVUS_COLLECTION}' created.")
+    logger.info(f"Collection '{MILVUS_COLLECTION}' created.")
 
 
 def upsert_chunks(chunks: list[dict]):
@@ -59,15 +65,23 @@ def upsert_chunks(chunks: list[dict]):
             "session_id":      c.get("session_id", ""),
             "filename":        c["filename"],
             "text":            c["text"][:4000],
-            "section_heading": (c["section_heading"] or "")[:500],
+            "section_heading": (c.get("section_heading") or "")[:500],
             "page":            str(c["page"]) if c["page"] is not None else "",
             "start_char":      c["start_char"],
             "end_char":        c["end_char"],
             "token_count":     c["token_count"],
         })
 
-    client.upsert(collection_name=MILVUS_COLLECTION, data=rows)
-    print(f"Upserted {len(rows)} chunks.")
+    # batch upsert to avoid gRPC connection spam
+    total_batches = (len(rows) + _UPSERT_BATCH_SIZE - 1) // _UPSERT_BATCH_SIZE
+    for i in range(0, len(rows), _UPSERT_BATCH_SIZE):
+        batch = rows[i: i + _UPSERT_BATCH_SIZE]
+        client.upsert(collection_name=MILVUS_COLLECTION, data=batch)
+        logger.info(
+            f"[milvus] upsert batch "
+            f"{i // _UPSERT_BATCH_SIZE + 1}/{total_batches} "
+            f"— {len(batch)} chunks"
+        )
 
 
 def search(
@@ -76,16 +90,13 @@ def search(
     top_k:        int = 5,
     doc_id:       str | None = None,
 ) -> list[dict]:
-    """
-    Search by session_id (across all docs in session).
-    Optionally scope to a single doc_id for edit operations.
-    """
     client = get_client()
 
-    if doc_id:
-        filter_expr = f'session_id == "{session_id}" && doc_id == "{doc_id}"'
-    else:
-        filter_expr = f'session_id == "{session_id}"'
+    filter_expr = (
+        f'session_id == "{session_id}" && doc_id == "{doc_id}"'
+        if doc_id
+        else f'session_id == "{session_id}"'
+    )
 
     results = client.search(
         collection_name=MILVUS_COLLECTION,
@@ -100,7 +111,7 @@ def search(
 
     hits = []
     for hit in results[0]:
-        entity = hit["entity"]
+        entity        = hit["entity"]
         entity["score"] = hit["distance"]
         hits.append(entity)
 
@@ -108,16 +119,13 @@ def search(
 
 
 def get_all_chunks(session_id: str, doc_id: str | None = None) -> list[dict]:
-    """
-    Retrieve all chunks for a session (or single doc within session).
-    Used for summarise intent.
-    """
     client = get_client()
 
-    if doc_id:
-        filter_expr = f'session_id == "{session_id}" && doc_id == "{doc_id}"'
-    else:
-        filter_expr = f'session_id == "{session_id}"'
+    filter_expr = (
+        f'session_id == "{session_id}" && doc_id == "{doc_id}"'
+        if doc_id
+        else f'session_id == "{session_id}"'
+    )
 
     return client.query(
         collection_name=MILVUS_COLLECTION,
@@ -135,7 +143,7 @@ def delete_session(session_id: str):
         collection_name=MILVUS_COLLECTION,
         filter=f'session_id == "{session_id}"',
     )
-    print(f"Deleted all chunks for session_id='{session_id}'.")
+    logger.info(f"[milvus] deleted session '{session_id}'")
 
 
 def delete_document(doc_id: str):
@@ -144,4 +152,38 @@ def delete_document(doc_id: str):
         collection_name=MILVUS_COLLECTION,
         filter=f'doc_id == "{doc_id}"',
     )
-    print(f"Deleted all chunks for doc_id='{doc_id}'.")
+    logger.info(f"[milvus] deleted doc '{doc_id}'")
+    
+
+def search_per_doc(
+    query_vector: list[float],
+    session_id:   str,
+    doc_ids:      list[str],
+    top_k:        int = 3,
+) -> dict[str, list[dict]]:
+    """
+    Search each document separately and return results keyed by doc_id.
+    Used for side-by-side comparison.
+    """
+    client  = get_client()
+    results = {}
+
+    for doc_id in doc_ids:
+        hits = client.search(
+            collection_name=MILVUS_COLLECTION,
+            data=[query_vector],
+            filter=f'session_id == "{session_id}" && doc_id == "{doc_id}"',
+            limit=top_k,
+            output_fields=[
+                "chunk_id", "doc_id", "session_id", "filename", "text",
+                "section_heading", "page", "start_char", "end_char",
+            ],
+        )
+        doc_hits = []
+        for hit in hits[0]:
+            entity          = hit["entity"]
+            entity["score"] = hit["distance"]
+            doc_hits.append(entity)
+        results[doc_id] = doc_hits
+
+    return results
