@@ -12,3 +12,4 @@ wheels/
 .env
 
 doc_chat.db
+*.db
