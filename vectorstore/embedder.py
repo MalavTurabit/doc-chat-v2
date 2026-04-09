@@ -19,7 +19,7 @@ _client = AzureOpenAI(
 
 _enc            = tiktoken.get_encoding("cl100k_base")
 _BATCH_SIZE     = 50
-_BATCH_DELAY    = 0.4
+_BATCH_DELAY    = 0.3
 _MAX_TOKENS     = 8000   # stay safely under the 8192 limit
 
 

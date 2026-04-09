@@ -236,7 +236,7 @@ def _parse_pptx(path: Path) -> list[dict]:
 # ── XLSX ──────────────────────────────────────────────────────────────────────
 
 
-_XLSX_ROWS_PER_CHUNK = 80
+_XLSX_ROWS_PER_CHUNK = 20
 
 
 def _parse_xlsx(path: Path) -> list[dict]:
@@ -301,7 +301,7 @@ def _parse_xlsx(path: Path) -> list[dict]:
 # ── CSV ───────────────────────────────────────────────────────────────────────
 
 # Same row-per-chunk constant as XLSX
-_CSV_ROWS_PER_CHUNK = 80
+_CSV_ROWS_PER_CHUNK = 20
 
 
 def _parse_csv(path: Path) -> list[dict]:
@@ -310,13 +310,31 @@ def _parse_csv(path: Path) -> list[dict]:
     blocks = []
     char_cursor = 0
 
-    with open(str(path), newline="", encoding="utf-8-sig") as f:
-        reader   = csv.reader(f)
-        all_rows = []
-        for row in reader:
-            row_text = " | ".join(cell.strip() for cell in row)
-            if row_text.strip(" |"):
-                all_rows.append(row_text)
+    # try encodings in order — utf-8-sig handles BOM, latin-1 handles
+    # Windows/Excel exports with special characters
+    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
+    raw_rows  = None
+
+    for encoding in encodings:
+        try:
+            with open(str(path), newline="", encoding=encoding) as f:
+                reader   = csv.reader(f)
+                raw_rows = list(reader)
+            break   # success — stop trying
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    if raw_rows is None:
+        raise ValueError(
+            f"Could not decode '{path.name}'. "
+            f"Please save the file as UTF-8 and re-upload."
+        )
+
+    all_rows = []
+    for row in raw_rows:
+        row_text = " | ".join(cell.strip() for cell in row)
+        if row_text.strip(" |"):
+            all_rows.append(row_text)
 
     if not all_rows:
         return blocks
@@ -338,7 +356,7 @@ def _parse_csv(path: Path) -> list[dict]:
         })
         return blocks
 
-    # large CSV — chunk by row count, header repeated every chunk
+    # large CSV — chunk by row count
     for i in range(0, len(data_rows), _CSV_ROWS_PER_CHUNK):
         row_group = data_rows[i: i + _CSV_ROWS_PER_CHUNK]
         text      = (
@@ -360,15 +378,28 @@ def _parse_csv(path: Path) -> list[dict]:
 
     return blocks
 
-
 # ── TXT ───────────────────────────────────────────────────────────────────────
 
 def _parse_txt(path: Path) -> list[dict]:
     blocks = []
     char_cursor = 0
 
-    with open(str(path), encoding="utf-8", errors="ignore") as f:
-        raw = f.read()
+    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
+    raw = None
+
+    for encoding in encodings:
+        try:
+            with open(str(path), encoding=encoding) as f:
+                raw = f.read()
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+
+    if raw is None:
+        raise ValueError(
+            f"Could not decode '{path.name}'. "
+            f"Please save the file as UTF-8 and re-upload."
+        )
 
     paragraphs = [p.strip() for p in raw.split("\n\n") if p.strip()]
 

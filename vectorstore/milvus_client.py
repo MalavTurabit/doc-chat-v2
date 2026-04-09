@@ -187,3 +187,74 @@ def search_per_doc(
         results[doc_id] = doc_hits
 
     return results
+
+
+def keyword_search(
+    session_id: str,
+    keyword:    str,
+    top_k:      int = 10,
+) -> list[dict]:
+    """
+    Exact keyword match within chunk text.
+    Used as fallback for tabular data lookups by name/ID.
+    """
+    client = get_client()
+
+    # Milvus supports LIKE for VARCHAR fields
+    safe_keyword = keyword.replace('"', '').replace("'", "")
+
+    try:
+        results = client.query(
+            collection_name=MILVUS_COLLECTION,
+            filter=f'session_id == "{session_id}" && text like "%{safe_keyword}%"',
+            output_fields=[
+                "chunk_id", "doc_id", "session_id", "filename", "text",
+                "section_heading", "page", "start_char", "end_char",
+            ],
+            limit=top_k,
+        )
+        return results
+    except Exception as e:
+        logger.warning(f"[milvus] keyword search failed: {e}")
+        return []
+    
+    
+def search_by_page(session_id: str, page: str, top_k: int = 5) -> list[dict]:
+    """Retrieve chunks from a specific page number."""
+    client = get_client()
+    try:
+        results = client.query(
+            collection_name=MILVUS_COLLECTION,
+            filter=f'session_id == "{session_id}" && page == "{page}"',
+            output_fields=[
+                "chunk_id", "doc_id", "session_id", "filename", "text",
+                "section_heading", "page", "start_char", "end_char",
+            ],
+            limit=top_k,
+        )
+        logger.info(f"[milvus] page search '{page}' → {len(results)} hits")
+        return results
+    except Exception as e:
+        logger.warning(f"[milvus] page search failed: {e}")
+        return []
+
+
+def search_by_section(session_id: str, section: str, top_k: int = 5) -> list[dict]:
+    """Retrieve chunks from a specific section heading."""
+    client = get_client()
+    safe_section = section.replace('"', '').replace("'", "")
+    try:
+        results = client.query(
+            collection_name=MILVUS_COLLECTION,
+            filter=f'session_id == "{session_id}" && section_heading like "%{safe_section}%"',
+            output_fields=[
+                "chunk_id", "doc_id", "session_id", "filename", "text",
+                "section_heading", "page", "start_char", "end_char",
+            ],
+            limit=top_k,
+        )
+        logger.info(f"[milvus] section search '{section}' → {len(results)} hits")
+        return results
+    except Exception as e:
+        logger.warning(f"[milvus] section search failed: {e}")
+        return []

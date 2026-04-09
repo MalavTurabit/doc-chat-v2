@@ -3,27 +3,15 @@ from langgraph.graph import MessagesState
 
 
 class DocState(MessagesState):
-    # session
-    session_id: str
-
-    # document (optional — used only for single-doc edit scoping)
-    doc_id:   str
-    filename: str
-
-    # routing
-    intent: Literal["summarise", "explain", "qa", "edit"] | None
-
-    # retrieval
+    session_id:       str
+    doc_id:           str
+    filename:         str
+    intent:           Literal["general","summarise","explain","qa","edit","compare","analyse"] | None
+    query_type:       str      
     retrieved_chunks: list[dict]
-
-    # memory — last N messages injected into prompts
-    memory: list[dict]
-
-    # generation
-    response:    str
-    sources:     list[str]
-    edit_record: dict
-
-    # edit tracking
-    current_text: str
-    edit_history: list[dict]
+    memory:           list[dict]
+    response:         str
+    sources:          list[str]
+    edit_record:      dict
+    current_text:     str
+    edit_history:     list[dict]
