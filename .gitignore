@@ -13,3 +13,6 @@ wheels/
 
 doc_chat.db
 *.db
+
+embedding_log.txt
+embedding_reports/
