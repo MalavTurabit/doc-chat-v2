@@ -34,11 +34,13 @@ def extract(file_path: str) -> dict:
 
 def _parse_pdf(path: Path) -> list[dict]:
     import fitz
+    from rapidocr_onnxruntime import RapidOCR
 
-    doc = fitz.open(str(path))
-    blocks = []
+    doc         = fitz.open(str(path))
+    blocks      = []
     char_cursor = 0
 
+    # ── pass 1: try normal text extraction ───────────────────────────────
     for page_num, page in enumerate(doc, start=1):
         page_dict = page.get_text("dict")
 
@@ -75,8 +77,75 @@ def _parse_pdf(path: Path) -> list[dict]:
             })
 
     doc.close()
-    return blocks
 
+    # ── check if text extraction produced meaningful content ──────────────
+    full_text = _build_full_text(blocks)
+    if len(full_text.strip()) >= 50:
+        return blocks   # text layer found — no OCR needed
+
+    # ── pass 2: image-based PDF — fall back to RapidOCR ──────────────────
+    print(f"[ocr] '{path.name}' has no text layer — running RapidOCR...")
+    blocks      = []
+    char_cursor = 0
+    ocr_engine  = RapidOCR()
+    doc         = fitz.open(str(path))
+
+    for page_num, page in enumerate(doc, start=1):
+        print(f"[ocr] processing page {page_num}/{len(doc)}...")
+
+        # render page as high-res image (2x zoom for better OCR accuracy)
+        mat        = fitz.Matrix(2, 2)
+        pix        = page.get_pixmap(matrix=mat)
+        img_bytes  = pix.tobytes("png")
+
+        # run OCR
+        result, _ = ocr_engine(img_bytes)
+
+        if not result:
+            print(f"[ocr] page {page_num} — no text detected")
+            continue
+
+        # result is a list of [bbox, text, confidence]
+        # sort by vertical position (top to bottom reading order)
+        result_sorted = sorted(result, key=lambda x: x[0][0][1])
+
+        page_lines = []
+        for item in result_sorted:
+            text       = item[1].strip()
+            confidence = item[2]
+            if text and confidence > 0.5:   # filter low confidence
+                page_lines.append(text)
+
+        if not page_lines:
+            continue
+
+        page_text = "\n".join(page_lines)
+        start     = char_cursor
+        end       = char_cursor + len(page_text)
+        char_cursor = end + 1
+
+        blocks.append({
+            "type":       "paragraph",
+            "text":       page_text,
+            "page":       page_num,
+            "start_char": start,
+            "end_char":   end,
+        })
+
+        print(f"[ocr] page {page_num} — extracted {len(page_lines)} lines")
+
+    doc.close()
+
+    # ── final check — if OCR also failed ─────────────────────────────────
+    full_text = _build_full_text(blocks)
+    if len(full_text.strip()) < 50:
+        raise ValueError(
+            f"'{path.name}' could not be read — either the PDF is empty, "
+            f"corrupted, or the image quality is too low for OCR."
+        )
+
+    print(f"[ocr] '{path.name}' complete — {len(blocks)} pages extracted")
+    return blocks
 
 # ── DOCX ──────────────────────────────────────────────────────────────────────
 
@@ -133,62 +202,7 @@ def _parse_docx(path: Path) -> list[dict]:
     return blocks
 
 
-# ── PPTX ──────────────────────────────────────────────────────────────────────
 
-def _parse_pdf(path: Path) -> list[dict]:
-    import fitz
-
-    doc = fitz.open(str(path))
-    blocks = []
-    char_cursor = 0
-
-    for page_num, page in enumerate(doc, start=1):
-        page_dict = page.get_text("dict")
-
-        for block in page_dict["blocks"]:
-            if block["type"] != 0:
-                continue
-
-            lines = []
-            for line in block["lines"]:
-                line_text = " ".join(
-                    span["text"] for span in line["spans"]
-                ).strip()
-                if line_text:
-                    lines.append(line_text)
-
-            text = "\n".join(lines).strip()
-            if not text:
-                continue
-
-            first_size = block["lines"][0]["spans"][0]["size"] \
-                if block["lines"] else 0
-            elem_type  = "heading" if first_size >= 14 else "paragraph"
-
-            start = char_cursor
-            end   = char_cursor + len(text)
-            char_cursor = end + 1
-
-            blocks.append({
-                "type":       elem_type,
-                "text":       text,
-                "page":       page_num,
-                "start_char": start,
-                "end_char":   end,
-            })
-
-    doc.close()
-
-    # guard: if almost no text was extracted, PDF is likely image-based
-    full_text = _build_full_text(blocks)
-    if len(full_text.strip()) < 50:
-        raise ValueError(
-            f"'{path.name}' appears to be an image-based or scanned PDF with no "
-            f"extractable text. Please use a PDF with selectable text, or run OCR "
-            f"on it first before uploading."
-        )
-
-    return blocks
 # ── PPTX ──────────────────────────────────────────────────────────────────────
 
 def _parse_pptx(path: Path) -> list[dict]:

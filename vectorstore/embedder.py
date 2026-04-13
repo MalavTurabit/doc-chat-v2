@@ -1,3 +1,6 @@
+import time
+import logging
+import tiktoken
 from openai import AzureOpenAI
 from config import (
     AZURE_OPENAI_EMB_KEY,
@@ -5,9 +8,6 @@ from config import (
     AZURE_EMB_API_VERSION,
     AZURE_EMB_DEPLOYMENT,
 )
-import logging
-import time
-import tiktoken
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +17,10 @@ _client = AzureOpenAI(
     api_version=AZURE_EMB_API_VERSION,
 )
 
-_enc            = tiktoken.get_encoding("cl100k_base")
-_BATCH_SIZE     = 50
-_BATCH_DELAY    = 0.3
-_MAX_TOKENS     = 8000   # stay safely under the 8192 limit
+_enc         = tiktoken.get_encoding("cl100k_base")
+_BATCH_SIZE  = 50
+_BATCH_DELAY = 0.3
+_MAX_TOKENS  = 8000
 
 
 def _truncate(text: str) -> str:
@@ -36,15 +36,18 @@ def _truncate(text: str) -> str:
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a list of strings in batches.
+    Returns vectors in the same order as input.
+    """
     all_embeddings = []
     total_batches  = (len(texts) + _BATCH_SIZE - 1) // _BATCH_SIZE
-
-    # truncate any oversized texts before sending
-    texts = [_truncate(t) for t in texts]
+    texts          = [_truncate(t) for t in texts]
 
     for i in range(0, len(texts), _BATCH_SIZE):
         batch     = texts[i: i + _BATCH_SIZE]
         batch_num = i // _BATCH_SIZE + 1
+
         logger.info(
             f"[embed] batch {batch_num}/{total_batches} — {len(batch)} texts"
         )
@@ -66,6 +69,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def embed_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Attach an 'embedding' field to each chunk dict in place.
+    Returns the same list with embeddings added.
+    """
     texts   = [c["text"] for c in chunks]
     vectors = embed_texts(texts)
     for chunk, vector in zip(chunks, vectors):
@@ -74,4 +81,7 @@ def embed_chunks(chunks: list[dict]) -> list[dict]:
 
 
 def embed_query(query: str) -> list[float]:
+    """
+    Embed a single query string for retrieval.
+    """
     return embed_texts([query])[0]
