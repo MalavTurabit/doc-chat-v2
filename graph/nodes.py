@@ -6,9 +6,18 @@ from config import (
     AZURE_LLM_DEPLOYMENT,
 )
 from vectorstore.embedder import embed_query, embed_texts
-from vectorstore.milvus_client import search, get_all_chunks, upsert_chunks, search_per_doc ,keyword_search , search_by_page, search_by_section
+from vectorstore.milvus_client import (
+    search,
+    get_all_chunks,
+    upsert_chunks,
+    search_per_doc,
+    keyword_search,
+    search_by_page,
+    search_by_section,
+)
 from api.session import get_docs
 from graph.state import DocState
+import re
 
 _llm = AzureOpenAI(
     api_key=AZURE_OPENAI_LLM_KEY,
@@ -22,14 +31,26 @@ _MAX_CONTEXT_TOKENS   = 80_000
 
 
 def _chat(system: str, user: str) -> str:
-    response = _llm.chat.completions.create(
-        model=AZURE_LLM_DEPLOYMENT,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = _llm.chat.completions.create(
+            model=AZURE_LLM_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        error_str = str(e)
+        if "content_filter" in error_str or "ResponsibleAIPolicyViolation" in error_str:
+            return (
+                "I was unable to process this request because the document content "
+                "triggered Azure OpenAI's content safety filter. "
+                "This usually happens when the document contains sensitive content. "
+                "Please try a different query or document."
+            )
+        raise
 
 
 # ── Intent classifier ─────────────────────────────────────────────────────────
@@ -39,18 +60,20 @@ def classify_intent(state: DocState) -> dict:
 
     intent = _chat(
         system="""Classify the user message into exactly one of these labels:
-- general   : pure greetings (hi, hello), asking what the bot can do, completely off-topic questions unrelated to any document
-- summarise : user wants a summary or overview of the document(s) — includes "what is this doc", "what's in the file", "give me an overview"
-- explain   : user wants something specific explained in simple terms
-- qa        : user is asking a specific factual question about document content
-- edit      : user wants to modify, rephrase, delete or add text
-- compare   : user wants to compare two or more documents against each other
-- analyse   : user wants cross-document insights, patterns, contradictions, or trends
+- general    : pure greetings, asking what the bot can do, off-topic questions
+- summarise  : user wants a summary or overview of the document(s)
+- explain    : user wants something explained in simple terms
+- qa         : user is asking a specific factual question about document content
+- edit       : user wants to modify, rephrase, delete or add text
+- compare    : user wants to compare two or more documents against each other
+- analyse    : user wants cross-document insights, patterns, contradictions
+- show_image : user explicitly asks to see an image, chart, diagram or photo
 
 Important rules:
-- "what is this doc", "whats the doc", "what does this file contain" → summarise
+- "show me the chart", "display the image", "what does the graph look like", "can you show me" → show_image
+- "what is this doc", "whats in the file" → summarise
 - "hi", "hello", "what can you do" → general
-- Any question about document content → qa
+- Any factual question about document content → qa
 - When in doubt between general and qa/summarise → choose qa or summarise
 
 Reply with only the label, nothing else.""",
@@ -58,13 +81,17 @@ Reply with only the label, nothing else.""",
     )
 
     intent = intent.strip().lower()
-    if intent not in ("general", "summarise", "explain", "qa", "edit", "compare", "analyse"):
+    if intent not in (
+        "general", "summarise", "explain", "qa",
+        "edit", "compare", "analyse", "show_image"
+    ):
         intent = "qa"
 
     print(f"[intent] → {intent}")
     return {"intent": intent}
 
-# ── General handler — no retrieval needed ────────────────────────────────────
+
+# ── General handler ───────────────────────────────────────────────────────────
 
 def general_node(state: DocState) -> dict:
     last_msg   = state["messages"][-1].content
@@ -89,6 +116,7 @@ You can help the user with:
 - Editing or rephrasing sections
 - Comparing documents against each other
 - Cross-document analysis
+- Showing images, charts, and diagrams from documents
 
 You cannot answer general knowledge questions unrelated to the uploaded documents.
 Keep your response short and friendly.
@@ -97,30 +125,24 @@ If documents are uploaded, encourage the user to ask questions about them.""",
     )
 
     return {
-        "response": response,
-        "sources":  [],
+        "response":   response,
+        "sources":    [],
+        "image_refs": [],
     }
 
-# -─ Regex indentifier ─────────────────────────────────────────────────────────────
-import re
 
-# ── Query rewriter (follow-up resolver) ───────────────────────────────────────
+# ── Query rewriter (follow-up resolver) ──────────────────────────────────────
 
 def _rewrite_query_if_followup(query: str, memory: list[dict]) -> str:
-    """
-    Detects follow-up queries and rewrites them using conversation memory.
-    Only calls LLM if follow-up indicators are detected — saves cost.
-    """
     if not memory:
         return query
 
-    # fast regex check — follow-up indicators
     followup_patterns = [
-        r'\b(he|she|they|it|his|her|their|its)\b',   # pronouns
-        r'\b(that|this|those|these)\b',                # demonstratives
-        r'\bsame\b',                                   # "same person"
-        r'^(what about|how about|and|also|tell me more|what else)',  # continuations
-        r'\b(previous|last|above|mentioned)\b',        # references
+        r'\b(he|she|they|it|his|her|their|its)\b',
+        r'\b(that|this|those|these)\b',
+        r'\bsame\b',
+        r'^(what about|how about|and|also|tell me more|what else)',
+        r'\b(previous|last|above|mentioned)\b',
     ]
 
     is_followup = any(
@@ -129,10 +151,9 @@ def _rewrite_query_if_followup(query: str, memory: list[dict]) -> str:
     )
 
     if not is_followup:
-        return query   # not a follow-up — return as-is, no LLM call
+        return query
 
-    # build memory context for rewriter
-    last_turns = memory[-4:]   # last 2 turns is enough context
+    last_turns = memory[-4:]
     memory_str = "\n".join(
         f"{m['role'].upper()}: {m['content'][:200]}"
         for m in last_turns
@@ -163,26 +184,19 @@ Rewrite as standalone question:""",
 # ── Rule-based query type classifier ─────────────────────────────────────────
 
 def _classify_query_type(query: str) -> str:
-    """
-    Classifies query type using regex rules. Zero LLM cost.
-    Returns: identifier | name | analytical | positional | semantic
-    """
     q = query.lower().strip()
 
-    # ── identifier patterns ───────────────────────────────────────────────────
-    # ISBN, numeric IDs, codes like EMP-001, TXN-9981, alphanumeric codes
     identifier_patterns = [
-        r'\b\d{5,}\b',                      # 5+ digit number (ISBN, ID)
-        r'\b[A-Z]{2,}-\d+\b',               # EMP-001, TXN-9981
-        r'\b\d[\dX]{8,}\b',                 # ISBN-10/13 pattern
-        r'\bisbn\b',                         # explicit ISBN mention
-        r'\bcode\s*:?\s*\w+\b',             # "code: XYZ"
-        r'\bid\s*:?\s*[\w\d]+\b',           # "id: 123"
+        r'\b\d{5,}\b',
+        r'\b[A-Z]{2,}-\d+\b',
+        r'\b\d[\dX]{8,}\b',
+        r'\bisbn\b',
+        r'\bcode\s*:?\s*\w+\b',
+        r'\bid\s*:?\s*[\w\d]+\b',
     ]
     if any(re.search(p, query, re.IGNORECASE) for p in identifier_patterns):
         return "identifier"
 
-    # ── analytical patterns ───────────────────────────────────────────────────
     analytical_keywords = [
         "average", "avg", "mean", "total", "sum", "count",
         "how many", "how much", "maximum", "minimum", "max", "min",
@@ -194,26 +208,22 @@ def _classify_query_type(query: str) -> str:
     if any(kw in q for kw in analytical_keywords):
         return "analytical"
 
-    # ── positional patterns ───────────────────────────────────────────────────
     positional_patterns = [
-        r'\bpage\s+\d+\b',                  # page 5
-        r'\bsection\s+[\d\.]+\b',           # section 3.2
-        r'\bchapter\s+\d+\b',              # chapter 4
-        r'\brow\s+\d+\b',                  # row 145
-        r'\bslide\s+\d+\b',                # slide 3
-        r'\bsheet\s+\w+\b',               # sheet Sales
-        r'\bparagraph\s+\d+\b',           # paragraph 2
+        r'\bpage\s+\d+\b',
+        r'\bsection\s+[\d\.]+\b',
+        r'\bchapter\s+\d+\b',
+        r'\brow\s+\d+\b',
+        r'\bslide\s+\d+\b',
+        r'\bsheet\s+\w+\b',
+        r'\bparagraph\s+\d+\b',
     ]
     if any(re.search(p, q) for p in positional_patterns):
         return "positional"
 
-    # ── name patterns ─────────────────────────────────────────────────────────
-    # Two or more capitalised words = likely a person/entity name
     name_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b'
     if re.search(name_pattern, query):
         return "name"
 
-    # ── default ───────────────────────────────────────────────────────────────
     return "semantic"
 
 
@@ -225,7 +235,7 @@ def retriever_node(state: DocState) -> dict:
     intent     = state["intent"]
     memory     = state.get("memory", [])
 
-    # ── summarise — sample all chunks ────────────────────────────────────────
+    # ── summarise — sample all chunks ────────────────────────────────────
     if intent == "summarise":
         all_chunks = get_all_chunks(session_id=session_id)
         if len(all_chunks) > _MAX_SUMMARISE_CHUNKS:
@@ -234,17 +244,16 @@ def retriever_node(state: DocState) -> dict:
         else:
             chunks = all_chunks
         print(f"[retriever] summarise: {len(all_chunks)} total → {len(chunks)} sampled")
-        return {"retrieved_chunks": chunks}
+        return {"retrieved_chunks": chunks, "query_type": "semantic"}
 
-    # ── step 1: rewrite follow-up queries ────────────────────────────────────
+    # ── step 1: rewrite follow-up ─────────────────────────────────────────
     resolved_query = _rewrite_query_if_followup(query, memory)
 
-    # ── step 2: classify query type ──────────────────────────────────────────
+    # ── step 2: classify query type ───────────────────────────────────────
     query_type = _classify_query_type(resolved_query)
     print(f"[retriever] query_type={query_type}  resolved='{resolved_query}'")
 
-    # ── step 3: retrieve based on type ───────────────────────────────────────
-
+    # ── step 3: retrieve ──────────────────────────────────────────────────
     if query_type == "semantic":
         chunks = search(
             embed_query(resolved_query),
@@ -253,21 +262,18 @@ def retriever_node(state: DocState) -> dict:
         )
 
     elif query_type in ("identifier", "name"):
-        # semantic search first
         sem_chunks = search(
             embed_query(resolved_query),
             session_id=session_id,
             top_k=8,
         )
 
-        # extract keywords based on type
         if query_type == "identifier":
-            keywords = re.findall(r'\b\d[\dXx]{4,}\b', resolved_query)
+            keywords  = re.findall(r'\b\d[\dXx]{4,}\b', resolved_query)
             keywords += re.findall(r'\b[A-Z]{2,}-\d+\b', resolved_query)
-        else:  # name
+        else:
             keywords = re.findall(r'\b[A-Z][a-z]+\b', resolved_query)
 
-        # keyword search for each keyword
         kw_chunks = []
         seen_ids  = {c["chunk_id"] for c in sem_chunks}
         for kw in keywords[:5]:
@@ -284,7 +290,6 @@ def retriever_node(state: DocState) -> dict:
         )
 
     elif query_type == "analytical":
-        # fetch all chunks — LLM needs full data to compute
         all_chunks = get_all_chunks(session_id=session_id)
         if len(all_chunks) > _MAX_SUMMARISE_CHUNKS:
             step   = len(all_chunks) // _MAX_SUMMARISE_CHUNKS
@@ -294,7 +299,6 @@ def retriever_node(state: DocState) -> dict:
         print(f"[retriever] analytical: {len(chunks)} chunks")
 
     elif query_type == "positional":
-        # try to extract page/section number and filter by metadata
         page_match    = re.search(r'page\s+(\d+)', resolved_query, re.IGNORECASE)
         section_match = re.search(r'section\s+([\d\.]+)', resolved_query, re.IGNORECASE)
 
@@ -307,7 +311,6 @@ def retriever_node(state: DocState) -> dict:
             chunks  = search_by_section(session_id, section)
             print(f"[retriever] positional: section={section}  hits={len(chunks)}")
         else:
-            # fallback to semantic if we can't parse position
             chunks = search(
                 embed_query(resolved_query),
                 session_id=session_id,
@@ -322,6 +325,7 @@ def retriever_node(state: DocState) -> dict:
 
     print(f"[retriever] fetched {len(chunks)} chunks  (intent={intent}  type={query_type})")
     return {"retrieved_chunks": chunks, "query_type": query_type}
+
 
 # ── Context builder ───────────────────────────────────────────────────────────
 
@@ -356,6 +360,13 @@ def generate_node(state: DocState) -> dict:
 
     context = _trim_context(chunks)
     sources = list(dict.fromkeys(c.get("filename", "") for c in chunks))
+
+    # ── collect image refs — only chunks that have both flag and path ─────
+    image_refs = [
+        c["chunk_id"]
+        for c in chunks
+        if c.get("has_image") and c.get("image_path")
+    ]
 
     memory_str = ""
     if memory:
@@ -399,15 +410,57 @@ RULES you must follow at all times:
         ),
     }
 
-    # use query_type for analytical, intent for everything else
     prompt_key   = "analytical" if query_type == "analytical" else intent
     system, user = prompts.get(prompt_key, prompts["qa"])
     response     = _chat(system, user)
 
-    print(f"[generate] response length={len(response)} chars  sources={sources}")
+    print(
+        f"[generate] response length={len(response)} chars  "
+        f"sources={sources}  image_refs={image_refs}"
+    )
     return {
-        "response": response,
-        "sources":  sources,
+        "response":   response,
+        "sources":    sources,
+        "image_refs": image_refs,
+    }
+
+
+# ── Show image node ───────────────────────────────────────────────────────────
+
+def show_image_node(state: DocState) -> dict:
+    """
+    User explicitly asked to see an image, chart, diagram or photo.
+    Searches for image chunks and returns their chunk_ids for display.
+    """
+    query      = state["messages"][-1].content
+    session_id = state["session_id"]
+
+    q_vec  = embed_query(query)
+    chunks = search(q_vec, session_id=session_id, top_k=10)
+
+    # only return chunks that have both the flag and a saved image path
+    image_chunks = [
+        c for c in chunks
+        if c.get("has_image") and c.get("image_path")
+    ]
+
+    if not image_chunks:
+        return {
+            "response":   "I could not find any images related to your query in the uploaded documents.",
+            "sources":    [],
+            "image_refs": [],
+        }
+
+    image_refs   = [c["chunk_id"] for c in image_chunks]
+    sources      = list(dict.fromkeys(c.get("filename", "") for c in image_chunks))
+    descriptions = "\n\n".join(
+        f"- {c['text'][:200]}" for c in image_chunks
+    )
+
+    return {
+        "response":   f"Here are the relevant images I found:\n\n{descriptions}",
+        "sources":    sources,
+        "image_refs": image_refs,
     }
 
 
@@ -509,6 +562,8 @@ Rules:
         "end_char":        end_char,
         "token_count":     len(edited_chunk_text.split()),
         "embedding":       new_embedding,
+        "has_image":       target.get("has_image", False),
+        "image_path":      target.get("image_path", ""),
     }])
 
     response = (
@@ -521,35 +576,28 @@ Rules:
         "response":    response,
         "sources":     [filename],
         "edit_record": edit_record,
+        "image_refs":  [],
     }
-    
-    
+
+
 # ── Compare node ──────────────────────────────────────────────────────────────
 
 def compare_node(state: DocState) -> dict:
-    """
-    Fetch relevant chunks from each document separately
-    and ask LLM to compare them side by side.
-    """
-    
-
     query      = state["messages"][-1].content
     session_id = state["session_id"]
     memory     = state.get("memory", [])
 
-    # get all docs in session
     docs = get_docs(session_id)
 
     if len(docs) < 2:
         return {
-            "response": "Please upload at least two documents to compare.",
-            "sources":  [],
+            "response":   "Please upload at least two documents to compare.",
+            "sources":    [],
+            "image_refs": [],
         }
 
-    # embed query once
     q_vec = embed_query(query)
 
-    # search each doc separately — 4 chunks per doc
     per_doc_results = search_per_doc(
         query_vector=q_vec,
         session_id=session_id,
@@ -557,7 +605,6 @@ def compare_node(state: DocState) -> dict:
         top_k=4,
     )
 
-    # build side-by-side context block
     doc_sections = []
     sources      = []
 
@@ -568,9 +615,7 @@ def compare_node(state: DocState) -> dict:
         sources.append(filename)
 
         if not chunks:
-            doc_sections.append(
-                f"=== {filename} ===\nNo relevant content found."
-            )
+            doc_sections.append(f"=== {filename} ===\nNo relevant content found.")
             continue
 
         content = "\n\n".join(
@@ -608,20 +653,15 @@ Your job is to:
 
     print(f"[compare] docs={[d['filename'] for d in docs]}  sources={sources}")
     return {
-        "response": response,
-        "sources":  sources,
+        "response":   response,
+        "sources":    sources,
+        "image_refs": [],
     }
 
 
 # ── Analyse node ──────────────────────────────────────────────────────────────
 
 def analyse_node(state: DocState) -> dict:
-    """
-    Cross-document analysis — patterns, contradictions, insights across all docs.
-    Fetches a sample from every document and asks LLM to find patterns.
-    """
-    
-
     query      = state["messages"][-1].content
     session_id = state["session_id"]
     memory     = state.get("memory", [])
@@ -630,11 +670,13 @@ def analyse_node(state: DocState) -> dict:
 
     if len(docs) < 2:
         return {
-            "response": "Please upload at least two documents to analyse across.",
-            "sources":  [],
+            "response":   "Please upload at least two documents to analyse across.",
+            "sources":    [],
+            "image_refs": [],
         }
 
-    q_vec           = embed_query(query)
+    q_vec = embed_query(query)
+
     per_doc_results = search_per_doc(
         query_vector=q_vec,
         session_id=session_id,
@@ -652,9 +694,7 @@ def analyse_node(state: DocState) -> dict:
         sources.append(filename)
 
         if not chunks:
-            doc_sections.append(
-                f"=== {filename} ===\nNo relevant content found."
-            )
+            doc_sections.append(f"=== {filename} ===\nNo relevant content found.")
             continue
 
         content = "\n\n".join(
@@ -692,6 +732,7 @@ Your job is to:
 
     print(f"[analyse] docs={[d['filename'] for d in docs]}  sources={sources}")
     return {
-        "response": response,
-        "sources":  sources,
+        "response":   response,
+        "sources":    sources,
+        "image_refs": [],
     }

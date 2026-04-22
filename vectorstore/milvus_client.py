@@ -5,8 +5,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 _client: MilvusClient | None = None
-
-# upsert in batches to avoid gRPC too_many_pings
 _UPSERT_BATCH_SIZE = 500
 
 
@@ -24,19 +22,21 @@ def init_collection():
         logger.info(f"Collection '{MILVUS_COLLECTION}' already exists.")
         return
 
-    schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    sch = client.create_schema(auto_id=False, enable_dynamic_field=False)
 
-    schema.add_field("chunk_id",        DataType.VARCHAR, max_length=200, is_primary=True)
-    schema.add_field("embedding",       DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
-    schema.add_field("doc_id",          DataType.VARCHAR, max_length=100)
-    schema.add_field("session_id",      DataType.VARCHAR, max_length=100)
-    schema.add_field("filename",        DataType.VARCHAR, max_length=300)
-    schema.add_field("text",            DataType.VARCHAR, max_length=4000)
-    schema.add_field("section_heading", DataType.VARCHAR, max_length=500)
-    schema.add_field("page",            DataType.VARCHAR, max_length=50)
-    schema.add_field("start_char",      DataType.INT64)
-    schema.add_field("end_char",        DataType.INT64)
-    schema.add_field("token_count",     DataType.INT64)
+    sch.add_field("chunk_id",        DataType.VARCHAR, max_length=200,  is_primary=True)
+    sch.add_field("embedding",       DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+    sch.add_field("doc_id",          DataType.VARCHAR, max_length=100)
+    sch.add_field("session_id",      DataType.VARCHAR, max_length=100)
+    sch.add_field("filename",        DataType.VARCHAR, max_length=300)
+    sch.add_field("text",            DataType.VARCHAR, max_length=4000)
+    sch.add_field("section_heading", DataType.VARCHAR, max_length=500)
+    sch.add_field("page",            DataType.VARCHAR, max_length=50)
+    sch.add_field("start_char",      DataType.INT64)
+    sch.add_field("end_char",        DataType.INT64)
+    sch.add_field("token_count",     DataType.INT64)
+    sch.add_field("has_image",       DataType.BOOL)
+    sch.add_field("image_path",      DataType.VARCHAR, max_length=500)  # ← new
 
     index_params = client.prepare_index_params()
     index_params.add_index(
@@ -47,16 +47,25 @@ def init_collection():
 
     client.create_collection(
         collection_name=MILVUS_COLLECTION,
-        schema=schema,
+        schema=sch,
         index_params=index_params,
     )
     logger.info(f"Collection '{MILVUS_COLLECTION}' created.")
 
 
+# ── shared output fields ──────────────────────────────────────────────────────
+
+_OUTPUT_FIELDS = [
+    "chunk_id", "doc_id", "session_id", "filename", "text",
+    "section_heading", "page", "start_char", "end_char",
+    "has_image", "image_path",
+]
+
+
 def upsert_chunks(chunks: list[dict]):
     client = get_client()
+    rows   = []
 
-    rows = []
     for c in chunks:
         rows.append({
             "chunk_id":        c["chunk_id"],
@@ -70,9 +79,10 @@ def upsert_chunks(chunks: list[dict]):
             "start_char":      c["start_char"],
             "end_char":        c["end_char"],
             "token_count":     c["token_count"],
+            "has_image":       c.get("has_image", False),
+            "image_path":      c.get("image_path", ""),   # ← new
         })
 
-    # batch upsert to avoid gRPC connection spam
     total_batches = (len(rows) + _UPSERT_BATCH_SIZE - 1) // _UPSERT_BATCH_SIZE
     for i in range(0, len(rows), _UPSERT_BATCH_SIZE):
         batch = rows[i: i + _UPSERT_BATCH_SIZE]
@@ -103,22 +113,22 @@ def search(
         data=[query_vector],
         filter=filter_expr,
         limit=top_k,
-        output_fields=[
-            "chunk_id", "doc_id", "session_id", "filename", "text",
-            "section_heading", "page", "start_char", "end_char",
-        ],
+        output_fields=_OUTPUT_FIELDS,
     )
 
     hits = []
     for hit in results[0]:
-        entity        = hit["entity"]
-        entity["score"] = hit["distance"]
+        entity           = hit["entity"]
+        entity["score"]  = hit["distance"]
         hits.append(entity)
 
     return hits
 
 
-def get_all_chunks(session_id: str, doc_id: str | None = None) -> list[dict]:
+def get_all_chunks(
+    session_id: str,
+    doc_id:     str | None = None,
+) -> list[dict]:
     client = get_client()
 
     filter_expr = (
@@ -130,10 +140,7 @@ def get_all_chunks(session_id: str, doc_id: str | None = None) -> list[dict]:
     return client.query(
         collection_name=MILVUS_COLLECTION,
         filter=filter_expr,
-        output_fields=[
-            "chunk_id", "doc_id", "session_id", "filename", "text",
-            "section_heading", "page", "start_char", "end_char", "token_count",
-        ],
+        output_fields=_OUTPUT_FIELDS,
     )
 
 
@@ -153,7 +160,7 @@ def delete_document(doc_id: str):
         filter=f'doc_id == "{doc_id}"',
     )
     logger.info(f"[milvus] deleted doc '{doc_id}'")
-    
+
 
 def search_per_doc(
     query_vector: list[float],
@@ -161,10 +168,6 @@ def search_per_doc(
     doc_ids:      list[str],
     top_k:        int = 3,
 ) -> dict[str, list[dict]]:
-    """
-    Search each document separately and return results keyed by doc_id.
-    Used for side-by-side comparison.
-    """
     client  = get_client()
     results = {}
 
@@ -174,10 +177,7 @@ def search_per_doc(
             data=[query_vector],
             filter=f'session_id == "{session_id}" && doc_id == "{doc_id}"',
             limit=top_k,
-            output_fields=[
-                "chunk_id", "doc_id", "session_id", "filename", "text",
-                "section_heading", "page", "start_char", "end_char",
-            ],
+            output_fields=_OUTPUT_FIELDS,
         )
         doc_hits = []
         for hit in hits[0]:
@@ -194,42 +194,43 @@ def keyword_search(
     keyword:    str,
     top_k:      int = 10,
 ) -> list[dict]:
-    """
-    Exact keyword match within chunk text.
-    Used as fallback for tabular data lookups by name/ID.
-    """
     client = get_client()
 
-    # Milvus supports LIKE for VARCHAR fields
-    safe_keyword = keyword.replace('"', '').replace("'", "")
+    safe_keyword = (
+        keyword.replace('"', '')
+               .replace("'", "")
+               .replace("%", "")
+               .replace("\\", "")
+    )
+
+    if not safe_keyword:
+        return []
 
     try:
         results = client.query(
             collection_name=MILVUS_COLLECTION,
             filter=f'session_id == "{session_id}" && text like "%{safe_keyword}%"',
-            output_fields=[
-                "chunk_id", "doc_id", "session_id", "filename", "text",
-                "section_heading", "page", "start_char", "end_char",
-            ],
+            output_fields=_OUTPUT_FIELDS,
             limit=top_k,
         )
+        logger.info(f"[milvus] keyword '{safe_keyword}' → {len(results)} hits")
         return results
     except Exception as e:
-        logger.warning(f"[milvus] keyword search failed: {e}")
+        logger.warning(f"[milvus] keyword search failed for '{safe_keyword}': {e}")
         return []
-    
-    
-def search_by_page(session_id: str, page: str, top_k: int = 5) -> list[dict]:
-    """Retrieve chunks from a specific page number."""
+
+
+def search_by_page(
+    session_id: str,
+    page:       str,
+    top_k:      int = 5,
+) -> list[dict]:
     client = get_client()
     try:
         results = client.query(
             collection_name=MILVUS_COLLECTION,
             filter=f'session_id == "{session_id}" && page == "{page}"',
-            output_fields=[
-                "chunk_id", "doc_id", "session_id", "filename", "text",
-                "section_heading", "page", "start_char", "end_char",
-            ],
+            output_fields=_OUTPUT_FIELDS,
             limit=top_k,
         )
         logger.info(f"[milvus] page search '{page}' → {len(results)} hits")
@@ -239,18 +240,18 @@ def search_by_page(session_id: str, page: str, top_k: int = 5) -> list[dict]:
         return []
 
 
-def search_by_section(session_id: str, section: str, top_k: int = 5) -> list[dict]:
-    """Retrieve chunks from a specific section heading."""
+def search_by_section(
+    session_id: str,
+    section:    str,
+    top_k:      int = 5,
+) -> list[dict]:
     client = get_client()
     safe_section = section.replace('"', '').replace("'", "")
     try:
         results = client.query(
             collection_name=MILVUS_COLLECTION,
             filter=f'session_id == "{session_id}" && section_heading like "%{safe_section}%"',
-            output_fields=[
-                "chunk_id", "doc_id", "session_id", "filename", "text",
-                "section_heading", "page", "start_char", "end_char",
-            ],
+            output_fields=_OUTPUT_FIELDS,
             limit=top_k,
         )
         logger.info(f"[milvus] section search '{section}' → {len(results)} hits")

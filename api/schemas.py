@@ -17,8 +17,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response:   str
     intent:     str
-    sources:    list[str]   # filenames that contributed to the answer
-
+    sources:    list[str] = []
+    image_refs: list[str] = [] 
 
 class DownloadRequest(BaseModel):
     session_id: str

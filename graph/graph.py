@@ -9,6 +9,7 @@ from graph.nodes import (
     general_node,
     compare_node,
     analyse_node,
+    show_image_node,
 )
 
 
@@ -26,25 +27,28 @@ def build_graph():
     g.add_node("general",         general_node)
     g.add_node("compare",         compare_node)
     g.add_node("analyse",         analyse_node)
+    g.add_node("show_image",      show_image_node)
 
     g.set_entry_point("classify_intent")
 
     g.add_conditional_edges("classify_intent", route_intent, {
-        "general":   "general",
-        "summarise": "retriever",
-        "explain":   "retriever",
-        "qa":        "retriever",
-        "edit":      "edit",
-        "compare":   "compare",
-        "analyse":   "analyse",
+        "general":    "general",
+        "summarise":  "retriever",
+        "explain":    "retriever",
+        "qa":         "retriever",
+        "edit":       "edit",
+        "compare":    "compare",
+        "analyse":    "analyse",
+        "show_image": "show_image",
     })
 
-    g.add_edge("retriever", "generate")
-    g.add_edge("generate",  END)
-    g.add_edge("edit",      END)
-    g.add_edge("general",   END)
-    g.add_edge("compare",   END)
-    g.add_edge("analyse",   END)
+    g.add_edge("retriever",  "generate")
+    g.add_edge("generate",   END)
+    g.add_edge("edit",       END)
+    g.add_edge("general",    END)
+    g.add_edge("compare",    END)
+    g.add_edge("analyse",    END)
+    g.add_edge("show_image", END)
 
     return g.compile()
 
@@ -63,10 +67,12 @@ def run(
         "doc_id":           "",
         "filename":         "",
         "intent":           None,
+        "query_type":       "semantic",
         "retrieved_chunks": [],
         "memory":           memory or [],
         "response":         "",
         "sources":          [],
+        "image_refs":       [],
         "edit_record":      {},
         "current_text":     "",
         "edit_history":     [],
@@ -76,5 +82,6 @@ def run(
         "response":    result["response"],
         "intent":      result["intent"],
         "sources":     result.get("sources", []),
+        "image_refs":  result.get("image_refs", []),
         "edit_record": result.get("edit_record", {}),
     }

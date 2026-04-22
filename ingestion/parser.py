@@ -3,7 +3,7 @@ from pathlib import Path
 from config import SUPPORTED_EXTENSIONS
 
 
-def extract(file_path: str) -> dict:
+def extract(file_path: str, image_understanding: bool = False) -> dict:
     path = Path(file_path)
     ext  = path.suffix.lower()
 
@@ -11,15 +11,24 @@ def extract(file_path: str) -> dict:
         raise ValueError(f"Unsupported file type: {ext}")
 
     parsers = {
-        ".pdf":  _parse_pdf,
-        ".docx": _parse_docx,
-        ".pptx": _parse_pptx,
+        ".pdf":  lambda p: _parse_pdf(p, image_understanding),
+        ".docx": lambda p: _parse_docx(p, image_understanding),
+        ".pptx": lambda p: _parse_pptx(p, image_understanding),
         ".xlsx": _parse_xlsx,
         ".csv":  _parse_csv,
         ".txt":  _parse_txt,
+        ".png":  lambda p: _parse_image(p, image_understanding),
+        ".jpg":  lambda p: _parse_image(p, image_understanding),
+        ".jpeg": lambda p: _parse_image(p, image_understanding),
     }
 
-    blocks = parsers[ext](path)
+    result = parsers[ext](path)
+
+    if isinstance(result, tuple):
+        blocks, image_map = result
+    else:
+        blocks    = result
+        image_map = {}
 
     return {
         "doc_id":    str(uuid.uuid4()),
@@ -27,20 +36,96 @@ def extract(file_path: str) -> dict:
         "ext":       ext,
         "blocks":    blocks,
         "full_text": _build_full_text(blocks),
+        "image_map": image_map,
     }
+
+
+# ── PNG normaliser ────────────────────────────────────────────────────────────
+
+def _to_png(image_bytes: bytes) -> bytes:
+    """Convert any image format to PNG bytes for consistent storage."""
+    try:
+        from PIL import Image
+        import io
+        img    = Image.open(io.BytesIO(image_bytes))
+        output = io.BytesIO()
+        img.save(output, format="PNG")
+        return output.getvalue()
+    except Exception:
+        return image_bytes
+
+
+# ── Image understanding with GPT-4.1-mini ─────────────────────────────────────
+
+def _describe_image_with_llm(image_bytes: bytes, context: str = "") -> str:
+    """Send image bytes to GPT-4.1-mini vision and return a text description."""
+    import base64
+    from openai import AzureOpenAI
+    from config import (
+        AZURE_OPENAI_LLM_KEY,
+        AZURE_LLM_ENDPOINT,
+        AZURE_LLM_API_VERSION,
+        AZURE_LLM_DEPLOYMENT,
+    )
+
+    client = AzureOpenAI(
+        api_key=AZURE_OPENAI_LLM_KEY,
+        azure_endpoint=AZURE_LLM_ENDPOINT,
+        api_version=AZURE_LLM_API_VERSION,
+    )
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        "Describe this image in detail for document search purposes. "
+        "If it contains a chart or graph, describe the data, trends, and key values. "
+        "If it contains a table, extract the data as plain text. "
+        "If it contains a diagram or flowchart, explain what it shows. "
+        "If it contains a photo, describe what is visible. "
+        "Be specific with any numbers, labels, or text you can read."
+    )
+    if context:
+        prompt += f" Context: {context}"
+
+    try:
+        response = client.chat.completions.create(
+            model=AZURE_LLM_DEPLOYMENT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type":      "image_url",
+                        "image_url": {
+                            "url":    f"data:image/png;base64,{b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }],
+            max_tokens=500,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[vision] image description failed: {e}")
+        return ""
 
 
 # ── PDF ───────────────────────────────────────────────────────────────────────
 
-def _parse_pdf(path: Path) -> list[dict]:
+def _parse_pdf(path: Path, image_understanding: bool = False) -> tuple:
     import fitz
     from rapidocr_onnxruntime import RapidOCR
 
     doc         = fitz.open(str(path))
     blocks      = []
+    image_map   = {}
     char_cursor = 0
 
-    # ── pass 1: try normal text extraction ───────────────────────────────
+    # ── pass 1: normal text extraction ───────────────────────────────────
     for page_num, page in enumerate(doc, start=1):
         page_dict = page.get_text("dict")
 
@@ -74,18 +159,61 @@ def _parse_pdf(path: Path) -> list[dict]:
                 "page":       page_num,
                 "start_char": start,
                 "end_char":   end,
+                "has_image":  False,
             })
+
+        # ── embedded images (toggle ON only) ──────────────────────────────
+        if image_understanding:
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list):
+                try:
+                    xref        = img[0]
+                    base_image  = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+
+                    if len(image_bytes) < 5000:
+                        continue
+
+                    print(
+                        f"[vision] PDF page {page_num} "
+                        f"image {img_index+1}/{len(image_list)}..."
+                    )
+                    description = _describe_image_with_llm(
+                        image_bytes,
+                        context=f"page {page_num} of PDF document"
+                    )
+
+                    if description:
+                        block_index = len(blocks)
+                        start       = char_cursor
+                        end         = char_cursor + len(description)
+                        char_cursor = end + 1
+
+                        blocks.append({
+                            "type":       "paragraph",
+                            "text":       f"[Image on page {page_num}]: {description}",
+                            "page":       page_num,
+                            "start_char": start,
+                            "end_char":   end,
+                            "has_image":  True,
+                        })
+                        image_map[block_index] = _to_png(image_bytes)   # ← normalised
+
+                except Exception as e:
+                    print(f"[vision] failed to process image: {e}")
+                    continue
 
     doc.close()
 
     # ── check if text extraction produced meaningful content ──────────────
     full_text = _build_full_text(blocks)
     if len(full_text.strip()) >= 50:
-        return blocks   # text layer found — no OCR needed
+        return blocks, image_map
 
-    # ── pass 2: image-based PDF — fall back to RapidOCR ──────────────────
+    # ── pass 2: image-based PDF — RapidOCR fallback ───────────────────────
     print(f"[ocr] '{path.name}' has no text layer — running RapidOCR...")
     blocks      = []
+    image_map   = {}
     char_cursor = 0
     ocr_engine  = RapidOCR()
     doc         = fitz.open(str(path))
@@ -93,35 +221,30 @@ def _parse_pdf(path: Path) -> list[dict]:
     for page_num, page in enumerate(doc, start=1):
         print(f"[ocr] processing page {page_num}/{len(doc)}...")
 
-        # render page as high-res image (2x zoom for better OCR accuracy)
-        mat        = fitz.Matrix(2, 2)
-        pix        = page.get_pixmap(matrix=mat)
-        img_bytes  = pix.tobytes("png")
+        mat       = fitz.Matrix(2, 2)
+        pix       = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
 
-        # run OCR
         result, _ = ocr_engine(img_bytes)
 
         if not result:
             print(f"[ocr] page {page_num} — no text detected")
             continue
 
-        # result is a list of [bbox, text, confidence]
-        # sort by vertical position (top to bottom reading order)
         result_sorted = sorted(result, key=lambda x: x[0][0][1])
-
-        page_lines = []
-        for item in result_sorted:
-            text       = item[1].strip()
-            confidence = item[2]
-            if text and confidence > 0.5:   # filter low confidence
-                page_lines.append(text)
+        page_lines    = [
+            item[1].strip()
+            for item in result_sorted
+            if item[1].strip() and item[2] > 0.5
+        ]
 
         if not page_lines:
             continue
 
-        page_text = "\n".join(page_lines)
-        start     = char_cursor
-        end       = char_cursor + len(page_text)
+        page_text   = "\n".join(page_lines)
+        block_index = len(blocks)
+        start       = char_cursor
+        end         = char_cursor + len(page_text)
         char_cursor = end + 1
 
         blocks.append({
@@ -130,13 +253,15 @@ def _parse_pdf(path: Path) -> list[dict]:
             "page":       page_num,
             "start_char": start,
             "end_char":   end,
+            "has_image":  True,
         })
+
+        image_map[block_index] = _to_png(img_bytes)   # ← normalised
 
         print(f"[ocr] page {page_num} — extracted {len(page_lines)} lines")
 
     doc.close()
 
-    # ── final check — if OCR also failed ─────────────────────────────────
     full_text = _build_full_text(blocks)
     if len(full_text.strip()) < 50:
         raise ValueError(
@@ -145,15 +270,17 @@ def _parse_pdf(path: Path) -> list[dict]:
         )
 
     print(f"[ocr] '{path.name}' complete — {len(blocks)} pages extracted")
-    return blocks
+    return blocks, image_map
+
 
 # ── DOCX ──────────────────────────────────────────────────────────────────────
 
-def _parse_docx(path: Path) -> list[dict]:
+def _parse_docx(path: Path, image_understanding: bool = False) -> tuple:
     from docx import Document
 
-    doc = Document(str(path))
-    blocks = []
+    doc         = Document(str(path))
+    blocks      = []
+    image_map   = {}
     char_cursor = 0
 
     for para in doc.paragraphs:
@@ -175,6 +302,7 @@ def _parse_docx(path: Path) -> list[dict]:
             "style":      style,
             "start_char": start,
             "end_char":   end,
+            "has_image":  False,
         })
 
     for table in doc.tables:
@@ -197,58 +325,135 @@ def _parse_docx(path: Path) -> list[dict]:
             "style":      "Table",
             "start_char": start,
             "end_char":   end,
+            "has_image":  False,
         })
 
-    return blocks
+    # ── embedded images (toggle ON only) ──────────────────────────────────
+    if image_understanding:
+        for i, rel in enumerate(doc.part.rels.values()):
+            if "image" not in rel.reltype:
+                continue
+            try:
+                image_bytes = rel.target_part.blob
 
+                if len(image_bytes) < 5000:
+                    continue
+
+                print(f"[vision] DOCX image {i+1}...")
+                description = _describe_image_with_llm(
+                    image_bytes,
+                    context="embedded image in Word document"
+                )
+
+                if description:
+                    block_index = len(blocks)
+                    start       = char_cursor
+                    end         = char_cursor + len(description)
+                    char_cursor = end + 1
+
+                    blocks.append({
+                        "type":       "paragraph",
+                        "text":       f"[Embedded image]: {description}",
+                        "page":       None,
+                        "start_char": start,
+                        "end_char":   end,
+                        "has_image":  True,
+                    })
+                    image_map[block_index] = _to_png(image_bytes)   # ← normalised
+
+            except Exception as e:
+                print(f"[vision] DOCX image failed: {e}")
+                continue
+
+    return blocks, image_map
 
 
 # ── PPTX ──────────────────────────────────────────────────────────────────────
 
-def _parse_pptx(path: Path) -> list[dict]:
+def _parse_pptx(path: Path, image_understanding: bool = False) -> tuple:
     from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-    prs = Presentation(str(path))
-    blocks = []
+    prs         = Presentation(str(path))
+    blocks      = []
+    image_map   = {}
     char_cursor = 0
 
     for slide_num, slide in enumerate(prs.slides, start=1):
         for shape in slide.shapes:
-            if not shape.has_text_frame:
-                continue
 
-            try:
-                is_title = (
-                    shape.is_placeholder
-                    and shape.placeholder_format is not None
-                    and shape.placeholder_format.idx == 0
-                )
-            except Exception:
-                is_title = False
+            # ── text shapes ───────────────────────────────────────────────
+            if shape.has_text_frame:
+                try:
+                    is_title = (
+                        shape.is_placeholder
+                        and shape.placeholder_format is not None
+                        and shape.placeholder_format.idx == 0
+                    )
+                except Exception:
+                    is_title = False
 
-            for para in shape.text_frame.paragraphs:
-                text = para.text.strip()
-                if not text:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if not text:
+                        continue
+
+                    elem_type   = "heading" if is_title else "paragraph"
+                    start       = char_cursor
+                    end         = char_cursor + len(text)
+                    char_cursor = end + 1
+
+                    blocks.append({
+                        "type":       elem_type,
+                        "text":       text,
+                        "page":       slide_num,
+                        "start_char": start,
+                        "end_char":   end,
+                        "has_image":  False,
+                    })
+
+            # ── image shapes (toggle ON only) ─────────────────────────────
+            if image_understanding:
+                try:
+                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        image_bytes = shape.image.blob
+
+                        if len(image_bytes) < 5000:
+                            continue
+
+                        print(
+                            f"[vision] PPTX slide {slide_num} "
+                            f"image '{shape.name}'..."
+                        )
+                        description = _describe_image_with_llm(
+                            image_bytes,
+                            context=f"image on slide {slide_num} of presentation"
+                        )
+
+                        if description:
+                            block_index = len(blocks)
+                            start       = char_cursor
+                            end         = char_cursor + len(description)
+                            char_cursor = end + 1
+
+                            blocks.append({
+                                "type":       "paragraph",
+                                "text":       f"[Image on slide {slide_num}]: {description}",
+                                "page":       slide_num,
+                                "start_char": start,
+                                "end_char":   end,
+                                "has_image":  True,
+                            })
+                            image_map[block_index] = _to_png(image_bytes)   # ← normalised
+
+                except Exception as e:
+                    print(f"[vision] PPTX image failed: {e}")
                     continue
 
-                elem_type   = "heading" if is_title else "paragraph"
-                start       = char_cursor
-                end         = char_cursor + len(text)
-                char_cursor = end + 1
+    return blocks, image_map
 
-                blocks.append({
-                    "type":       elem_type,
-                    "text":       text,
-                    "page":       slide_num,
-                    "start_char": start,
-                    "end_char":   end,
-                })
-
-
-    return blocks
 
 # ── XLSX ──────────────────────────────────────────────────────────────────────
-
 
 _XLSX_ROWS_PER_CHUNK = 20
 
@@ -274,7 +479,6 @@ def _parse_xlsx(path: Path) -> list[dict]:
         header    = all_rows[0]
         data_rows = all_rows[1:]
 
-        # small sheet — single chunk
         full_text = f"[Sheet: {sheet.title}]\n" + "\n".join(all_rows)
         if len(data_rows) <= 50:
             start = char_cursor
@@ -289,7 +493,6 @@ def _parse_xlsx(path: Path) -> list[dict]:
             })
             continue
 
-        # large sheet — chunk by row count, header repeated every chunk
         for i in range(0, len(data_rows), _XLSX_ROWS_PER_CHUNK):
             row_group = data_rows[i: i + _XLSX_ROWS_PER_CHUNK]
             text      = (
@@ -314,27 +517,23 @@ def _parse_xlsx(path: Path) -> list[dict]:
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
 
-# Same row-per-chunk constant as XLSX
 _CSV_ROWS_PER_CHUNK = 20
 
 
 def _parse_csv(path: Path) -> list[dict]:
     import csv
 
-    blocks = []
+    blocks      = []
     char_cursor = 0
-
-    # try encodings in order — utf-8-sig handles BOM, latin-1 handles
-    # Windows/Excel exports with special characters
-    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
-    raw_rows  = None
+    encodings   = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
+    raw_rows    = None
 
     for encoding in encodings:
         try:
             with open(str(path), newline="", encoding=encoding) as f:
                 reader   = csv.reader(f)
                 raw_rows = list(reader)
-            break   # success — stop trying
+            break
         except (UnicodeDecodeError, UnicodeError):
             continue
 
@@ -356,7 +555,6 @@ def _parse_csv(path: Path) -> list[dict]:
     header    = all_rows[0]
     data_rows = all_rows[1:]
 
-    # small CSV — single chunk
     if len(data_rows) <= 50:
         full_text = f"[CSV: {path.name}]\n" + "\n".join(all_rows)
         start     = char_cursor
@@ -370,7 +568,6 @@ def _parse_csv(path: Path) -> list[dict]:
         })
         return blocks
 
-    # large CSV — chunk by row count
     for i in range(0, len(data_rows), _CSV_ROWS_PER_CHUNK):
         row_group = data_rows[i: i + _CSV_ROWS_PER_CHUNK]
         text      = (
@@ -392,14 +589,14 @@ def _parse_csv(path: Path) -> list[dict]:
 
     return blocks
 
+
 # ── TXT ───────────────────────────────────────────────────────────────────────
 
 def _parse_txt(path: Path) -> list[dict]:
-    blocks = []
+    blocks      = []
     char_cursor = 0
-
-    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
-    raw = None
+    encodings   = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
+    raw         = None
 
     for encoding in encodings:
         try:
@@ -438,6 +635,89 @@ def _parse_txt(path: Path) -> list[dict]:
         })
 
     return blocks
+
+
+# ── Image files (PNG, JPG, JPEG) ──────────────────────────────────────────────
+
+def _parse_image(path: Path, image_understanding: bool = False) -> tuple:
+    """
+    Parse a pure image file (PNG, JPG, JPEG).
+    RapidOCR extracts any text visible in the image.
+    Image is always saved to image_map regardless of toggle.
+    GPT-4.1-mini vision describes content if toggle is ON.
+    """
+    from rapidocr_onnxruntime import RapidOCR
+
+    blocks      = []
+    image_map   = {}
+    char_cursor = 0
+
+    with open(str(path), "rb") as f:
+        image_bytes = f.read()
+
+    # normalise to PNG once upfront
+    png_bytes = _to_png(image_bytes)
+
+    # ── RapidOCR for text ────────────────────────────────────────────────
+    print(f"[ocr] running OCR on image '{path.name}'...")
+    ocr_engine = RapidOCR()
+    result, _  = ocr_engine(png_bytes)
+
+    if result:
+        result_sorted = sorted(result, key=lambda x: x[0][0][1])
+        lines = [
+            item[1].strip()
+            for item in result_sorted
+            if item[1].strip() and item[2] > 0.5
+        ]
+        if lines:
+            ocr_text    = "\n".join(lines)
+            block_index = len(blocks)
+            start       = char_cursor
+            end         = char_cursor + len(ocr_text)
+            char_cursor = end + 1
+
+            blocks.append({
+                "type":       "paragraph",
+                "text":       f"[OCR text]: {ocr_text}",
+                "page":       1,
+                "start_char": start,
+                "end_char":   end,
+                "has_image":  True,   # always True — image file IS the content
+            })
+            image_map[block_index] = png_bytes   # ← always saved
+            print(f"[ocr] extracted {len(lines)} lines from image")
+
+    # ── GPT-4.1-mini vision for image understanding (toggle ON only) ──────
+    if image_understanding:
+        print(f"[vision] describing image '{path.name}'...")
+        description = _describe_image_with_llm(
+            png_bytes,
+            context=f"standalone image file: {path.name}"
+        )
+
+        if description:
+            block_index = len(blocks)
+            start       = char_cursor
+            end         = char_cursor + len(description)
+            char_cursor = end + 1
+
+            blocks.append({
+                "type":       "paragraph",
+                "text":       f"[Image description]: {description}",
+                "page":       1,
+                "start_char": start,
+                "end_char":   end,
+                "has_image":  True,
+            })
+            image_map[block_index] = png_bytes   # ← same image referenced again
+
+    if not blocks:
+        raise ValueError(
+            f"'{path.name}' — no text or content could be extracted."
+        )
+
+    return blocks, image_map
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
