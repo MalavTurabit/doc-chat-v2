@@ -1,17 +1,24 @@
-# Doc Chat
+# Doc Chat v2
 
-An AI-powered document assistant that lets you upload multiple documents, chat with them, edit content using natural language, and get an audio explanation — all through a clean Streamlit UI backed by a FastAPI server.
+An AI-powered document intelligence platform that lets you upload multiple documents, chat with them naturally, compare documents, perform cross-document analysis, edit content with natural language, view extracted images, and get audio explanations — all through a clean Streamlit UI backed by a FastAPI server.
 
 ---
 
 ## What it does
 
 - **Multi-document chat** — upload multiple files and ask questions across all of them in a single unified chat. The bot tells you which document each answer came from.
-- **Intent routing** — automatically detects whether you want to ask a question, get a summary, request a simple explanation, or make an edit.
-- **Natural language editing** — tell the bot what to change ("change annual leave from 7 to 10 days") and it finds the right section, applies the edit, and re-indexes the chunk.
-- **Conversation memory** — the bot remembers the last few turns so follow-up questions work naturally.
+- **Intent routing** — automatically detects whether you want to ask a question, summarise, explain, edit, compare, analyse, or view images.
+- **Image understanding** — extracts and displays images from uploaded documents. Scanned/image-based PDFs are processed via RapidOCR. Embedded images in PDFs, DOCX, and PPTX can be described using GPT-4.1-mini vision (toggle in sidebar).
+- **Image display in chat** — when an answer references a page or image, clickable image links appear directly in the chat.
+- **Cross-document comparison** — upload two or more documents and ask the bot to compare them side by side.
+- **Cross-document analysis** — find patterns, contradictions, insights, and gaps across all uploaded documents.
+- **Natural language editing** — tell the bot what to change and it finds the right section, applies the edit, and re-indexes the chunk.
+- **Smart retrieval** — rule-based query classifier routes queries to the right retrieval strategy: semantic search, keyword/identifier lookup, analytical sampling, or positional (page/section) filtering.
+- **Follow-up query rewriting** — detects pronouns and references ("what about her salary?") and rewrites them into standalone queries using conversation memory.
+- **Conversation memory** — the bot remembers the last 6 messages so follow-up questions work naturally.
 - **Audio explainer** — upload a document and get a spoken MP3 explanation in the style of a friend explaining it to you the night before an exam.
 - **Download updated TXT** — after edits, download the updated document as plain text.
+- **Guardrails** — the bot stays strictly within the uploaded document context and will not answer unrelated questions.
 
 ---
 
@@ -20,13 +27,16 @@ An AI-powered document assistant that lets you upload multiple documents, chat w
 | Layer | Technology |
 |---|---|
 | LLM | Azure OpenAI — GPT-4.1-mini |
+| LLM Vision | Azure OpenAI — GPT-4.1-mini (image input) |
 | Embeddings | Azure OpenAI — text-embedding-3-large (3072 dim) |
+| OCR | RapidOCR (rapidocr-onnxruntime) |
 | RAG framework | LangGraph + LangChain |
 | Vector store | Milvus-Lite (embedded, no server needed) |
 | Backend API | FastAPI + Uvicorn |
 | Frontend | Streamlit |
 | Text to speech | ElevenLabs |
 | Chunking | Paragraph-aware greedy merger with tiktoken |
+| Image normalisation | Pillow (PIL) |
 | Package manager | uv |
 | Language | Python 3.12 |
 
@@ -34,14 +44,16 @@ An AI-powered document assistant that lets you upload multiple documents, chat w
 
 ## Supported file types
 
-| Format | Parser |
-|---|---|
-| PDF | pymupdf (fitz) |
-| DOCX | python-docx |
-| PPTX | python-pptx |
-| XLSX | openpyxl (row-based chunking for large files) |
-| CSV | csv stdlib (row-based chunking for large files) |
-| TXT | stdlib (paragraph-aware) |
+| Format | Parser | Image support |
+|---|---|---|
+| PDF (text layer) | pymupdf (fitz) | Embedded images via GPT-4.1-mini (toggle) |
+| PDF (scanned/image-based) | RapidOCR fallback | Page images always saved for display |
+| DOCX | python-docx | Embedded images via GPT-4.1-mini (toggle) |
+| PPTX | python-pptx | Picture shapes via GPT-4.1-mini (toggle) |
+| XLSX | openpyxl (row-based chunking) | — |
+| CSV | csv stdlib (row-based chunking) | — |
+| TXT | stdlib (paragraph-aware) | — |
+| PNG / JPG / JPEG | RapidOCR + optional vision | Always saved for display |
 
 ---
 
@@ -50,27 +62,28 @@ An AI-powered document assistant that lets you upload multiple documents, chat w
 ```
 doc-chat-v2/
 ├── api/
-│   ├── main.py          # FastAPI app — all routes
-│   ├── session.py       # In-memory session store + conversation memory
-│   └── schemas.py       # Pydantic request/response models
+│   ├── main.py             # FastAPI app — all routes
+│   ├── session.py          # In-memory session store + image path registry
+│   └── schemas.py          # Pydantic request/response models
 ├── ingestion/
-│   └── parser.py        # Format router + per-format text extractors
+│   └── parser.py           # Format router, per-format extractors, OCR, vision
 ├── vectorstore/
-│   ├── chunker.py       # Paragraph-aware greedy chunker
-│   ├── embedder.py      # Azure OpenAI embedding wrapper
-│   └── milvus_client.py # Milvus-Lite collection + search + upsert
+│   ├── chunker.py          # Paragraph-aware greedy chunker
+│   ├── embedder.py         # Azure OpenAI embedding wrapper with batching
+│   └── milvus_client.py    # Milvus-Lite schema, search, upsert, keyword search
 ├── graph/
-│   ├── state.py         # LangGraph DocState definition
-│   ├── nodes.py         # Intent classifier, retriever, generate, edit nodes
-│   └── graph.py         # Compiled LangGraph pipeline + run() entry point
+│   ├── state.py            # LangGraph DocState — includes image_refs field
+│   ├── nodes.py            # All nodes: classifier, retriever, generate, edit,
+│   │                       # compare, analyse, show_image, general
+│   └── graph.py            # Compiled LangGraph pipeline + run() entry point
 ├── export/
-│   └── reconstructor.py # Apply edits to full_text, return updated TXT
+│   └── reconstructor.py    # Apply edits to full_text, return updated TXT
 ├── pages/
 │   └── audio_explainer.py  # Streamlit audio explainer page
-├── app.py               # Streamlit main app
-├── config.py            # Centralised config — loads from .env
-├── requirements.txt
-└── .env                 # API keys (not committed)
+├── extracted_images/       # Saved page/embedded images (gitignored)
+├── app.py                  # Streamlit main app
+├── config.py               # Centralised config — loads from .env
+└── .env                    # API keys (not committed)
 ```
 
 ---
@@ -80,7 +93,7 @@ doc-chat-v2/
 ### 1. Clone and create environment
 
 ```bash
-git clone https://github.com/yourname/doc-chat-v2.git
+git clone https://github.com/MalavTurabit/doc-chat-v2.git
 cd doc-chat-v2
 uv venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
@@ -93,13 +106,8 @@ uv add pymupdf python-docx python-pptx openpyxl python-dotenv \
        pymilvus[milvus_lite] tiktoken openai \
        langgraph langchain-openai langchain-core \
        fastapi uvicorn python-multipart \
-       streamlit elevenlabs
-```
-
-Or from requirements.txt:
-
-```bash
-uv pip install -r requirements.txt
+       streamlit elevenlabs \
+       rapidocr-onnxruntime Pillow
 ```
 
 ### 3. Configure environment
@@ -122,7 +130,7 @@ ELEVENLABS_API_KEY=your_elevenlabs_key
 
 ## Running
 
-Always start FastAPI first, then Streamlit — Milvus-Lite only allows one process to hold the database file at a time.
+Always start FastAPI first — Milvus-Lite only allows one process to hold the database file at a time.
 
 ```bash
 # Terminal 1 — FastAPI backend
@@ -133,8 +141,7 @@ uv run streamlit run app.py
 ```
 
 Open `http://localhost:8501` in your browser.
-
-FastAPI Swagger docs available at `http://localhost:8000/docs`.
+FastAPI Swagger docs: `http://localhost:8000/docs`
 
 ---
 
@@ -143,11 +150,72 @@ FastAPI Swagger docs available at `http://localhost:8000/docs`.
 | Method | Route | Description |
 |---|---|---|
 | POST | `/session` | Create a new session, returns `session_id` |
-| GET | `/session/{session_id}` | Get session info — docs, message count, edit count |
-| POST | `/upload` | Upload and index a document into a session |
-| POST | `/chat` | Send a query, get a response with sources and intent |
-| GET | `/download/{session_id}` | Download updated TXT (all docs or single doc) |
-| DELETE | `/session/{session_id}` | Clear session — removes docs from Milvus and memory |
+| GET | `/session/{session_id}` | Get session info |
+| POST | `/upload` | Upload and index a document |
+| POST | `/chat` | Send a query, get response + sources + image_refs |
+| GET | `/image/{chunk_id}` | Serve extracted image as PNG |
+| GET | `/image_b64/{chunk_id}` | Serve image as base64 JSON |
+| GET | `/download/{session_id}` | Download updated TXT |
+| DELETE | `/session/{session_id}` | Clear session from Milvus and memory |
+
+---
+
+## Intent routing
+
+```
+user query
+    └── intent classifier (GPT-4.1-mini)
+            ├── general    → friendly response about bot capabilities
+            ├── summarise  → sample all chunks → generate summary
+            ├── explain    → retrieve top-6 → explain simply
+            ├── qa         → query classifier → smart retrieval → generate
+            │                   ├── identifier  → keyword + semantic hybrid
+            │                   ├── name        → keyword + semantic hybrid
+            │                   ├── analytical  → all chunks sampled
+            │                   ├── positional  → page/section metadata filter
+            │                   └── semantic    → ANN vector search
+            ├── edit       → retrieve top-3 → LLM picks chunk → apply edit
+            │                              → re-embed → upsert Milvus
+            ├── compare    → search per-doc → side-by-side LLM comparison
+            ├── analyse    → search per-doc → cross-doc pattern analysis
+            └── show_image → search for has_image chunks → return image links
+```
+
+---
+
+## Image pipeline
+
+```
+Upload (any file type)
+    ↓
+parser extracts image bytes → image_map {block_index: png_bytes}
+    ↓
+api/main.py saves images to:
+    ./extracted_images/{session_id}/{chunk_id}.png
+    ↓
+image_path stored on chunk → upserted to Milvus (has_image=True, image_path=...)
+    ↓
+Chat query
+    ↓
+retriever fetches chunks with has_image=True + image_path
+    ↓
+generate_node / show_image_node returns image_refs (list of chunk_ids)
+    ↓
+FastAPI GET /image/{chunk_id} → looks up image_path from Milvus → FileResponse
+    ↓
+Streamlit renders clickable links → user clicks → image opens in browser tab
+```
+
+**When images are extracted per file type:**
+
+| File type | Toggle OFF | Toggle ON |
+|---|---|---|
+| PDF (scanned) | Page PNGs always saved | Same |
+| PDF (text layer) | No images | Embedded charts/diagrams described + saved |
+| DOCX | No images | Embedded images described + saved |
+| PPTX | No images | Picture shapes described + saved |
+| PNG / JPG | Always saved | Also described by GPT-4.1-mini |
+| XLSX / CSV / TXT | Never | Never |
 
 ---
 
@@ -155,69 +223,49 @@ FastAPI Swagger docs available at `http://localhost:8000/docs`.
 
 Documents are split using a **paragraph-aware greedy merger**:
 
-- Headings are never chunked alone — they become `section_heading` metadata on the following chunk
+- Headings become `section_heading` metadata on the following chunk — never chunked alone
 - Tables always get their own chunk regardless of size
-- For large CSV/XLSX files, rows are chunked in groups of ~300 tokens with the header row repeated on every chunk
-- Chunk size limit: 480 tokens with 50 token overlap
-- Token counting uses `tiktoken` with `cl100k_base` encoding (same as GPT-4)
+- CSV/XLSX: rows chunked in groups of 20 rows with header repeated every chunk
+- Chunk size: 480 tokens with 50 token overlap
+- Token counting: `tiktoken` with `cl100k_base` encoding
 
 ---
 
-## RAG pipeline
+## Session persistence
 
-```
-user query
-    └── intent classifier (GPT-4.1-mini)
-            ├── summarise → retrieve all chunks → generate
-            ├── explain   → retrieve top-6 chunks → generate
-            ├── qa        → retrieve top-6 chunks → generate
-            └── edit      → retrieve top-3 → LLM picks best → apply edit
-                                                             → re-embed
-                                                             → upsert Milvus
-```
+Session data is stored in two places:
 
-All retrieval is scoped to the current `session_id` so queries search across all uploaded documents automatically. Each retrieved chunk carries its `filename` so the generator can cite the source in the answer.
+| Data | Storage | Survives restart? |
+|---|---|---|
+| Chunk vectors + metadata | Milvus-Lite (`doc_chat.db`) | ✅ Yes |
+| Image files | `./extracted_images/` on disk | ✅ Yes |
+| Image paths | Milvus `image_path` field | ✅ Yes |
+| Doc list, memory, edits | In-memory Python dicts | ❌ No |
+
+After FastAPI restarts, `get_docs()` automatically rebuilds the doc list from Milvus so chat continues to work. Image paths are looked up directly from Milvus so images still display after restart.
 
 ---
 
 ## Audio explainer
 
-Navigate to the **Audio Explainer** page from the sidebar. Upload any supported document and click **Generate audio explanation**. The pipeline:
+Navigate to **Audio Explainer** from the sidebar. The pipeline:
 
-1. Sends a summarise query through the RAG pipeline with a "friend explaining before an exam" prompt
-2. Passes the generated script to ElevenLabs TTS
-3. Returns an MP3 you can play in the browser or download
+1. Sends a summarise query with a "friend explaining before an exam" system prompt
+2. Passes the script to ElevenLabs TTS (voice: George, model: eleven_multilingual_v2)
+3. Returns an MP3 playable in the browser or downloadable
 
-ElevenLabs free tier gives 10,000 characters/month. Scripts are kept under 900 words (~4,500 characters) to stay within limits.
-
----
-
-## Git workflow
-
-```bash
-# after each module
-git add .
-git commit -m "feat: description"
-
-# check history
-git log --oneline
-
-# undo uncommitted changes
-git stash
-
-# go back to last commit
-git checkout .
-```
+ElevenLabs free tier: 10,000 characters/month. Scripts are kept under 900 words.
 
 ---
 
 ## Known limitations
 
-- Session memory is in-process only — restarting FastAPI clears all sessions and chat history
-- Milvus-Lite allows only one process to open the `.db` file — always run FastAPI before Streamlit
+- Session memory (chat history, edit records) is lost on FastAPI restart — only vector data and images persist
+- Milvus-Lite allows only one process to open the `.db` file — always start FastAPI before Streamlit
 - ElevenLabs free tier has a 10,000 character/month limit
-- PDF heading detection uses font size heuristic (`>= 14pt`) — may need tuning per document
-- Edit pipeline applies only the specific change requested — dependent calculations (e.g. totals in a spreadsheet) are not automatically recalculated
+- Analytical queries (averages, counts) are approximate — LLM sees a sample of chunks, not all data
+- Image-based PDFs with very low resolution or handwriting may produce poor OCR results
+- Azure content safety filters may block responses for documents with certain content
 
 ---
 
@@ -226,6 +274,7 @@ git checkout .
 - [LangGraph](https://github.com/langchain-ai/langgraph)
 - [Milvus-Lite](https://milvus.io/docs/milvus_lite.md)
 - [Azure OpenAI](https://azure.microsoft.com/en-us/products/ai-services/openai-service)
+- [RapidOCR](https://github.com/RapidAI/RapidOCR)
 - [ElevenLabs](https://elevenlabs.io)
 - [Streamlit](https://streamlit.io)
 - [FastAPI](https://fastapi.tiangolo.com)

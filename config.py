@@ -16,7 +16,11 @@ AZURE_LLM_API_VERSION  = os.getenv("AZURE_LLM_API_VERSION")
 AZURE_LLM_DEPLOYMENT   = os.getenv("AZURE_LLM_DEPLOYMENT")
 
 # ── Extraction ───────────────────────────────────────────────────────────────
-SUPPORTED_EXTENSIONS   = {".pdf", ".docx", ".pptx", ".xlsx",".csv", ".txt"}
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".pptx",
+    ".xlsx", ".csv", ".txt",
+    ".png", ".jpg", ".jpeg",   
+}
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
 CHUNK_SIZE_TOKENS      = 400
