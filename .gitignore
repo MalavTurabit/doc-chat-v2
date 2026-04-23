@@ -16,3 +16,6 @@ doc_chat.db
 
 embedding_log.txt
 embedding_reports/
+
+
+extracted_images/
